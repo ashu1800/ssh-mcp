@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Annotated, Literal
 
@@ -13,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from ssh_mcp.errors import ConfirmationRequired, ToolFailure
 from ssh_mcp.ssh.pool import ConnectionPool
-from ssh_mcp.ssh.transfer import SftpTransferEngine, TransferResult, resolve_local_target
+from ssh_mcp.ssh.transfer import SftpTransferEngine, resolve_local_target
 from ssh_mcp.tools.helpers import tool_err, tool_ok
 
 logger = logging.getLogger(__name__)

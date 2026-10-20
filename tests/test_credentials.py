@@ -6,7 +6,6 @@ import httpx2
 import pytest
 
 from ssh_mcp.credentials.client import CredentialClient
-from ssh_mcp.config import Settings
 from ssh_mcp.errors import ToolFailure
 from tests.conftest import TOKEN
 

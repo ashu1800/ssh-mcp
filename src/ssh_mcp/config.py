@@ -153,7 +153,11 @@ class Settings:
     # --- commands ------------------------------------------------------------
     command_timeout_default: float = 30.0
     command_timeout_max: float = 600.0
-    command_max_output_bytes: int = 1024 * 1024
+    # Per-stream cap for captured output. Kept below the tool result text
+    # budget (512 KiB in tools/helpers.py) so a command that fills the cap is
+    # still delivered; otherwise every large `cat`/`journalctl` turns into a
+    # result_too_large error instead of truncated output.
+    command_max_output_bytes: int = 256 * 1024
 
     # --- sftp ----------------------------------------------------------------
     sftp_block_size: int = 256 * 1024
@@ -292,7 +296,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         command_timeout_default=src.number("SSH_MCP_COMMAND_TIMEOUT_DEFAULT", "command_timeout_default", 30.0, minimum=1.0),
         command_timeout_max=src.number("SSH_MCP_COMMAND_TIMEOUT_MAX", "command_timeout_max", 600.0, minimum=1.0),
         command_max_output_bytes=src.integer(
-            "SSH_MCP_COMMAND_MAX_OUTPUT_BYTES", "command_max_output_bytes", 1024 * 1024, minimum=1024
+            "SSH_MCP_COMMAND_MAX_OUTPUT_BYTES", "command_max_output_bytes", 256 * 1024, minimum=1024
         ),
         sftp_block_size=src.integer(
             "SSH_MCP_SFTP_BLOCK_SIZE", "sftp_block_size", 256 * 1024, minimum=16 * 1024, maximum=4 * 1024 * 1024

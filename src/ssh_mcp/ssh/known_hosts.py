@@ -56,29 +56,21 @@ class KnownHostsStore:
         return keys
 
     def pinned_store(self, host: str, addr: str | None, port: int) -> asyncssh.SSHKnownHosts | None:
-        """Return a snapshot containing only ``host``'s entries, or ``None`` when unpinned.
+        """Return the pin store when ``host`` is pinned, else ``None``.
 
-        AsyncSSH accepts a :class:`~asyncssh.SSHKnownHosts` object as
-        ``known_hosts``; it runs every key in it through the trust check, so the
-        snapshot must hold exactly this host's lines and nothing else.
+        The whole store is handed to AsyncSSH rather than a hand-filtered
+        snapshot, so its own rules for hashed entries (``|1|salt|hash``, the
+        OpenSSH default on Debian/Ubuntu), wildcard patterns
+        (``*.example.com``), IPv4/IPv6 pins, and the non-default-port fallback
+        all apply. Re-parsing the file with a literal host comparison used to
+        disagree with :meth:`lookup` for exactly those entries; returning
+        ``None`` then disabled host-key verification for the connection and
+        replaced the existing pin with whatever key the peer presented.
         """
         store = self.load()
         if not self._match(store, host, addr, port):
             return None
-        pattern = host_pattern(host, port)
-        lines: list[str] = []
-        for line in self._path.read_text(encoding="utf-8", errors="replace").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            fields = stripped.split(None, 1)
-            if not fields:
-                continue
-            if pattern in fields[0].split(","):
-                lines.append(stripped)
-        if not lines:
-            return None
-        return asyncssh.import_known_hosts("\n".join(lines) + "\n")
+        return store
 
     @staticmethod
     def _match(store: asyncssh.SSHKnownHosts, host: str, addr: str | None, port: int):

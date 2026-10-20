@@ -18,8 +18,6 @@ import logging
 import uvicorn
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -92,7 +90,7 @@ def _default_allowed_origins(settings: Settings) -> list[str]:
     return origins
 
 
-def build_http_app(server: MCPServer, settings: Settings) -> Starlette:
+def build_http_app(server: MCPServer, settings: Settings) -> ASGIApp:
     """Return the ASGI app for the Streamable HTTP transport."""
     allowed_origins = _default_allowed_origins(settings)
     if settings.http_is_loopback:
@@ -114,17 +112,14 @@ def build_http_app(server: MCPServer, settings: Settings) -> Starlette:
         host=settings.http_host,
     )
 
-    # Rebuild the app around the same routes and lifespan so our guards run
-    # outermost, without touching the MCP session manager's wiring.
-    middleware = [Middleware(OriginGuardMiddleware, allowed_origins=allowed_origins)]
+    # The SDK app is kept as-is and wrapped: rebuilding a Starlette instance
+    # from its routes would silently drop any middleware the SDK installs
+    # (auth context, body limits) now or in a future release.
+    app: ASGIApp = mcp_app
     if settings.http_bearer_token:
-        middleware.append(Middleware(BearerAuthMiddleware, token=settings.http_bearer_token))
-
-    return Starlette(
-        routes=list(mcp_app.routes),
-        middleware=middleware,
-        lifespan=mcp_app.router.lifespan_context,
-    )
+        app = BearerAuthMiddleware(app, token=settings.http_bearer_token)
+    app = OriginGuardMiddleware(app, allowed_origins=allowed_origins)
+    return app
 
 
 async def run_http(server: MCPServer, settings: Settings) -> None:

@@ -16,14 +16,26 @@ from ssh_mcp.ssh.pool import ConnectionPool
 
 logger = logging.getLogger(__name__)
 
-INTERACTIVE_COMMANDS = frozenset(
+# Programs that never make sense without a terminal: they take over the screen
+# or wait for keystrokes and would hang an exec channel.
+_ALWAYS_INTERACTIVE = frozenset(
     {
-        "vi", "vim", "nvim", "nano", "emacs", "less", "more", "most", "top", "htop", "atop",
-        "btop", "iftop", "watch", "man", "tail -f", "journalctl -f", "screen", "tmux", "mc",
-        "nmtui", "alsamixer", "mysql", "psql", "redis-cli", "ssh", "telnet", "ftp", "sftp",
-        "python", "python3", "node", "bash -i", "sh -i", "irb",
+        "vi", "vim", "nvim", "nano", "emacs", "less", "more", "most", "htop", "atop",
+        "btop", "iftop", "watch", "man", "screen", "tmux", "mc", "nmtui", "alsamixer",
     }
 )
+# Programs that are interactive only when started without anything to run: with
+# a script/query/host argument they terminate on their own. Treating them as
+# interactive outright rejects routine commands such as
+# ``python3 manage.py migrate`` or ``mysql -e 'select 1'``.
+_REPL_WITHOUT_ARGS = frozenset(
+    {
+        "python", "python3", "node", "irb", "mysql", "psql", "redis-cli", "ssh", "telnet",
+        "ftp", "sftp", "bash", "sh", "zsh", "fish", "tcsh", "csh", "pwsh", "powershell",
+    }
+)
+# Commands that stream forever only under a specific flag.
+_FOLLOW_FLAGS = frozenset({"-f", "-F", "--follow", "--follow=yes"})
 
 
 @dataclass
@@ -75,10 +87,48 @@ def _interactive_reason(command: str) -> str | None:
             if not tokens:
                 continue
             program = tokens[0].rsplit("/", 1)[-1]
-            joined = " ".join(tokens[:2])
-            if program in INTERACTIVE_COMMANDS or joined in INTERACTIVE_COMMANDS:
-                return joined
+            rest = tokens[1:]
+            if program in _ALWAYS_INTERACTIVE:
+                return program
+            if program == "top" and not any(token in {"-b", "-H", "-n"} for token in rest):
+                # ``top -b -n1`` is the documented batch alternative.
+                return program
+            if program in {"tail", "journalctl"} and _FOLLOW_FLAGS.intersection(rest):
+                return f"{program} {' '.join(sorted(_FOLLOW_FLAGS.intersection(rest)))}"
+            if program in _REPL_WITHOUT_ARGS and not _has_program_argument(program, rest):
+                return program
     return None
+
+
+def _has_program_argument(program: str, rest: list[str]) -> bool:
+    """Whether ``rest`` gives the REPL something to run instead of a prompt.
+
+    Every one of these programs falls back to reading commands from stdin when
+    it gets nothing to execute, and the exec channel's stdin stays open -- so
+    "no argument" means "hangs until the timeout".
+    """
+    # An input redirect hands the program a file instead of our open channel.
+    if "<" in rest:
+        return True
+    positional = [token for token in rest if not token.startswith("-")]
+    flags = {token for token in rest if token.startswith("-")}
+    if program in {"python", "python3", "node", "irb"}:
+        return bool(positional) or bool(flags & {"-c", "-m", "-e", "-p", "--eval", "--print"})
+    if program in {"bash", "sh", "zsh", "fish", "tcsh", "csh"}:
+        return bool(positional) or bool(flags & {"-c", "-i"})
+    if program in {"pwsh", "powershell"}:
+        return bool(flags & {"-Command", "-File", "-c", "-EncodedCommand"})
+    if program in {"mysql", "psql", "redis-cli"}:
+        # The database name / query is positional only for redis-cli; for
+        # mysql/psql the query comes through a flag.
+        return bool(flags & {"-e", "-c", "-f", "--execute", "--command", "--file"}) or (
+            program == "redis-cli" and bool(positional)
+        )
+    if program in {"ssh", "telnet"}:
+        # ``ssh host`` alone opens a shell; ``ssh host uptime`` runs and exits.
+        return len(positional) >= 2
+    # ftp/sftp read commands from stdin unless given a batch file.
+    return bool(flags & {"-b", "--batch-file"})
 
 
 # Wrappers that run another program; the program after them is the real subject.
@@ -158,6 +208,21 @@ class CommandRunner:
         acquired = await self._pool.acquire(handle)
         try:
             return await self._execute(acquired.conn, command, timeout=timeout, cap=cap)
+        except ToolFailure:
+            raise
+        except (asyncssh.ChannelOpenError, asyncssh.ConnectionLost, ConnectionError, OSError) as exc:
+            # The connection died between acquire() and the exec request, or
+            # mid-command: report it as a structured, retryable failure instead
+            # of letting asyncssh's exception escape the tool boundary.
+            logger.warning("command failed because the SSH connection went away: %s", type(exc).__name__)
+            raise ToolFailure(
+                "connection_lost",
+                stage="execute",
+                hint="SSH 连接已断开，命令可能未执行或已中断；请重新 connect 后重试。",
+                retryable=True,
+                connection_handle=handle,
+                detail=type(exc).__name__,
+            ) from None
         finally:
             self._pool.release(acquired.entry)
 

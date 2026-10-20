@@ -166,6 +166,6 @@ SSH_MCP_RUN_LARGE=1 pytest -m large -q           # 1 GB 内存基线
 
 ## 已知取舍
 
-1. SSH 压缩在连接级协商。`compression=auto` 时按首次建立连接的目标文件类型决定（已压缩格式关闭压缩），同一 `(host, port, username)` 上后续文件沿用该决定。
+1. SSH 压缩在连接级协商，因此只能按连接配置：`auto` 与 `on` 等价（协商 zlib），`off` 关闭压缩。连接在 `connect` 时建立，此时还没有目标文件，池 key `(host, port, username)` 也不含压缩维度，所以不做按文件扩展名的判断；需要为大批已压缩文件关压缩时，把 `SSH_MCP_COMPRESSION=off` 并重新 `connect`。
 2. HTTP 无状态模式下，客户端断开会触发请求取消；`json_response=False`（默认 SSE）是保证进度与取消可用的前提。
 3. Windows 上无法设置 POSIX 权限位，`chmod` 作用于远端不受影响，本地密钥文件权限依赖 ACL。

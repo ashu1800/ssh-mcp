@@ -83,19 +83,27 @@ class Connector:
 
     # -- public ---------------------------------------------------------------
 
-    async def connect(self, payload: CredentialPayload, *, compression: str | None = None) -> ConnectResult:
+    async def connect(
+        self, payload: CredentialPayload, *, compression: str | None = None, timeout: float | None = None
+    ) -> ConnectResult:
         record = self._auth_state.get(*payload.key)
         compression_choice = compression or self._compression_for(None)
         warning: str | None = None
         key_rejected = False
 
         if payload.auth.type == "private_key":
-            return await self._connect_with_service_key(payload, compression_choice)
+            return await self._connect_with_service_key(payload, compression_choice, timeout)
 
         local_key = self._keys.load(*payload.key)
         if record.state is AuthState.KEY_READY and local_key is not None:
             try:
-                conn = await self._open(payload, client_keys=[local_key], preferred_auth="publickey", compression=compression_choice)
+                conn = await self._open(
+                    payload,
+                    client_keys=[local_key],
+                    preferred_auth="publickey",
+                    compression=compression_choice,
+                    timeout=timeout,
+                )
                 await self._auth_state.set_state(*payload.key, AuthState.KEY_READY, auth_method="publickey")
                 return ConnectResult(conn=conn, auth_method="publickey", compression=compression_choice)
             except ConnectFailure as exc:
@@ -116,7 +124,9 @@ class Connector:
                 stage="auth",
                 server_id=str(payload.server_id),
             )
-        conn = await self._open(payload, client_keys=None, preferred_auth="password", compression=compression_choice)
+        conn = await self._open(
+            payload, client_keys=None, preferred_auth="password", compression=compression_choice, timeout=timeout
+        )
 
         # --- key provisioning -------------------------------------------------
         key = local_key or self._keys.create(
@@ -129,7 +139,7 @@ class Connector:
             logger.warning("could not install the local public key on %s: %s", payload.host, type(exc).__name__)
             install_note = f"写入远端 authorized_keys 失败：{type(exc).__name__}"
 
-        verified = await self._verify_key_login(payload, key, compression_choice)
+        verified, verify_error = await self._verify_key_login(payload, key, compression_choice, timeout)
         if verified:
             await self._auth_state.set_state(*payload.key, AuthState.KEY_READY, auth_method="password")
             auth_method = "password"
@@ -145,18 +155,28 @@ class Connector:
                 compression=compression_choice,
             )
 
-        await self._auth_state.mark_key_invalid(*payload.key)
-        warning = (
-            "密码登录成功，但新生成的公钥未能通过验证，已保持 PASSWORD_FALLBACK；"
-            "后续连接仍会使用密码。"
-        )
+        if verify_error == "auth_failed_publickey":
+            # The key itself was refused: stop offering it.
+            await self._auth_state.mark_key_invalid(*payload.key)
+            warning = (
+                "密码登录成功，但新生成的公钥未能通过验证，已保持 PASSWORD_FALLBACK；"
+                "后续连接仍会使用密码。"
+            )
+        else:
+            # A network/host-key failure says nothing about the key. Keep the
+            # state as it was so the next attempt can still try the key, and
+            # surface the real reason instead of blaming the key.
+            warning = (
+                f"密码登录成功，但用于验证新公钥的独立连接失败（{verify_error}）；"
+                "未改动密钥状态，下次连接会继续尝试。"
+            )
         if install_note:
             warning += f" （{install_note}）"
         return ConnectResult(
             conn=conn,
             auth_method="password",
             warning=warning,
-            key_rejected=True,
+            key_rejected=verify_error == "auth_failed_publickey",
             compression=compression_choice,
         )
 
@@ -174,7 +194,7 @@ class Connector:
     def compression_for_path(self, path: str | Path | None) -> str:
         return self._compression_for(path)
 
-    def _base_kwargs(self, payload: CredentialPayload, compression: str) -> dict:
+    def _base_kwargs(self, payload: CredentialPayload, compression: str, timeout: float | None = None) -> dict:
         try:
             pinned = self._known_hosts.pinned_store(payload.host, None, payload.port)
         except HostKeyStoreError as exc:
@@ -186,8 +206,8 @@ class Connector:
             "host": payload.host,
             "port": payload.port,
             "username": payload.username,
-            "connect_timeout": self._settings.connect_timeout,
-            "login_timeout": self._settings.login_timeout,
+            "connect_timeout": timeout or self._settings.connect_timeout,
+            "login_timeout": timeout or self._settings.login_timeout,
             "keepalive_interval": self._settings.keepalive_interval,
             "keepalive_count_max": self._settings.keepalive_count_max,
             # Never consult ~/.ssh/config: IdentityFile/ProxyJump there would
@@ -215,8 +235,9 @@ class Connector:
         client_keys: list[asyncssh.SSHKey] | None,
         preferred_auth: str,
         compression: str,
+        timeout: float | None = None,
     ) -> asyncssh.SSHClientConnection:
-        kwargs = self._base_kwargs(payload, compression)
+        kwargs = self._base_kwargs(payload, compression, timeout)
         kwargs["client_keys"] = client_keys
         kwargs["preferred_auth"] = preferred_auth
         if preferred_auth == "password":
@@ -288,7 +309,9 @@ class Connector:
                 logger.warning("could not pin host key for %s: %s", payload.host, type(exc).__name__)
         return conn
 
-    async def _connect_with_service_key(self, payload: CredentialPayload, compression: str) -> ConnectResult:
+    async def _connect_with_service_key(
+        self, payload: CredentialPayload, compression: str, timeout: float | None = None
+    ) -> ConnectResult:
         try:
             key = asyncssh.import_private_key(payload.auth.private_key, passphrase=payload.auth.passphrase or None)
         except (asyncssh.KeyImportError, ValueError) as exc:
@@ -300,7 +323,9 @@ class Connector:
                 detail=type(exc).__name__,
             ) from None
         try:
-            conn = await self._open(payload, client_keys=[key], preferred_auth="publickey", compression=compression)
+            conn = await self._open(
+                payload, client_keys=[key], preferred_auth="publickey", compression=compression, timeout=timeout
+            )
         except ConnectFailure as exc:
             if exc.error == "auth_failed_publickey":
                 raise ConnectFailure(
@@ -359,8 +384,10 @@ class Connector:
             await sftp.chmod(tmp_path, 0o600)
             try:
                 await sftp.posix_rename(tmp_path, auth_path)
-            except asyncssh.SFTPError:
-                # Servers without the posix-rename extension: remove then rename.
+            except asyncssh.SFTPOpUnsupported:
+                # Only a missing posix-rename extension can be replaced by the
+                # non-atomic sequence; other errors must not delete the user's
+                # authorized_keys before the rename has a chance to succeed.
                 try:
                     await sftp.remove(auth_path)
                 except asyncssh.SFTPNoSuchFile:
@@ -373,20 +400,29 @@ class Connector:
             sftp.exit()
             await sftp.wait_closed()
 
-    async def _verify_key_login(self, payload: CredentialPayload, key: asyncssh.SSHKey, compression: str) -> bool:
-        """Prove the newly installed key works on a fresh connection."""
+    async def _verify_key_login(
+        self, payload: CredentialPayload, key: asyncssh.SSHKey, compression: str, timeout: float | None = None
+    ) -> tuple[bool, str]:
+        """Prove the newly installed key works on a fresh connection.
+
+        Returns ``(verified, error)`` where ``error`` names why verification
+        failed: only ``auth_failed_publickey`` means the key itself was refused;
+        host-key and connectivity failures must not be read as a bad key.
+        """
         try:
-            conn = await self._open(payload, client_keys=[key], preferred_auth="publickey", compression=compression)
+            conn = await self._open(
+                payload, client_keys=[key], preferred_auth="publickey", compression=compression, timeout=timeout
+            )
         except ConnectFailure as exc:
             logger.warning("public key verification failed for %s: %s", payload.host, exc.error)
-            return False
+            return False, exc.error
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "public key verification failed for %s: %s: %s", payload.host, type(exc).__name__, exc, exc_info=True
             )
-            return False
+            return False, type(exc).__name__
         conn.close()
-        return True
+        return True, ""
 
     @staticmethod
     def _hostname() -> str:

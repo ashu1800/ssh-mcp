@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
+from pathlib import Path
 
 import asyncssh
 import pytest
@@ -12,7 +14,7 @@ from ssh_mcp.ssh.auth_state import AuthState
 from ssh_mcp.ssh.connector import ConnectFailure
 from ssh_mcp.ssh.pool import ConnectionPool
 from tests import fake_ssh_server
-from tests.conftest import PASSWORD, USERNAME
+from tests.conftest import USERNAME
 
 
 @pytest.mark.asyncio
@@ -202,6 +204,49 @@ async def test_dead_connection_is_rebuilt(pool, credential_payload):
     assert rebuilt.handle != old_handle
     with pytest.raises(ToolFailure):
         await pool.acquire(old_handle)
+
+
+@pytest.mark.asyncio
+async def test_stale_handle_cannot_disconnect_the_rebuilt_connection(pool, credential_payload):
+    first = await pool.connect(credential_payload)
+    stale_handle = first.handle
+    rebuilt = await pool.connect(credential_payload, force_new=True)
+    assert rebuilt.handle != stale_handle
+
+    with pytest.raises(ToolFailure) as excinfo:
+        await pool.disconnect(stale_handle)
+
+    assert excinfo.value.error == "connection_not_found"
+    assert rebuilt.conn is not None and not rebuilt.conn.is_closed()
+    await pool.acquire(rebuilt.handle)  # still usable
+
+
+@pytest.mark.asyncio
+async def test_host_key_store_keeps_hashed_and_wildcard_pins():
+    """Pins written by ssh-keygen -H or with wildcards must still verify."""
+    import base64
+    import hashlib
+    import hmac
+
+    from ssh_mcp.ssh.known_hosts import KnownHostsStore
+
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    line = key.export_public_key("openssh")
+    line = line.decode() if isinstance(line, bytes) else line
+    with tempfile.TemporaryDirectory() as tmp:
+        salt = b"0123456789abcdef"
+        digest = hmac.new(salt, b"example.com", hashlib.sha1).digest()
+        hashed = "|1|" + base64.b64encode(salt).decode() + "|" + base64.b64encode(digest).decode()
+        path = Path(tmp) / "known_hosts"
+        path.write_text(f"{hashed} {line.strip()}\n", encoding="utf-8")
+        store = KnownHostsStore(path)
+        assert store.lookup("example.com", None, 22)
+        assert store.pinned_store("example.com", None, 22) is not None
+
+        path.write_text(f"*.example.com {line.strip()}\n", encoding="utf-8")
+        store = KnownHostsStore(path)
+        assert store.pinned_store("web.example.com", None, 22) is not None
+        assert store.pinned_store("other.test", None, 22) is None
 
 
 def _key_id(payload) -> str:

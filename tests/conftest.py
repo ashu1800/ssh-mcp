@@ -6,7 +6,6 @@ import json
 import socket
 from pathlib import Path
 
-import asyncssh
 import httpx2
 import pytest
 import pytest_asyncio

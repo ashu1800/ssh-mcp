@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from mcp.server.mcpserver import Context
 from mcp.types import CallToolResult
 from pydantic import Field
 

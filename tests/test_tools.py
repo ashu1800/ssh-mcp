@@ -12,7 +12,7 @@ from ssh_mcp.ssh.pool import ConnectionPool
 from ssh_mcp.ssh.auth_state import AuthStateStore
 from ssh_mcp.ssh.keys import KeyStore
 from ssh_mcp.ssh.known_hosts import KnownHostsStore
-from tests.conftest import PASSWORD, TOKEN, USERNAME
+from tests.conftest import PASSWORD, USERNAME
 
 
 @pytest.fixture
@@ -281,3 +281,109 @@ async def test_batch_upload_reports_per_item(app, settings, ssh_server):
     assert payload["succeeded"] == 1
     assert payload["failed"] == 1
     assert (ssh_server.home / "one.bin").read_bytes() == b"one"
+
+
+# -- regressions --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recursive_chmod_terminates_and_stays_inside_tree(app, ssh_server):
+    connect, _ = await call(app, "connect", server_id="1")
+    handle = connect["connection_handle"]
+    (ssh_server.home / "tree" / "sub").mkdir(parents=True)
+    (ssh_server.home / "tree" / "sub" / "a.txt").write_text("a")
+
+    payload, is_error = await call(
+        app, "change_permissions", connection_handle=handle, path="/tree", mode="700",
+        recursive=True, confirm=True,
+    )
+
+    assert is_error is False
+    assert payload["affected"] == 3  # /tree, /tree/sub, /tree/sub/a.txt; "." and ".." excluded
+    assert ssh_server.home.exists()
+
+
+@pytest.mark.asyncio
+async def test_rename_failure_keeps_the_existing_target(app, ssh_server):
+    connect, _ = await call(app, "connect", server_id="1")
+    (ssh_server.home / "important.txt").write_text("keep me")
+
+    payload, is_error = await call(
+        app, "rename_path", connection_handle=connect["connection_handle"],
+        old_path="/missing.txt", new_path="/important.txt", overwrite=True, confirm=True,
+    )
+
+    assert is_error is True
+    assert (ssh_server.home / "important.txt").read_text() == "keep me"
+
+
+@pytest.mark.asyncio
+async def test_make_directory_failures_are_structured(app, ssh_server):
+    connect, _ = await call(app, "connect", server_id="1")
+    handle = connect["connection_handle"]
+
+    missing_parent, is_error = await call(app, "make_directory", connection_handle=handle, path="/no/such/dir")
+    assert is_error is True and missing_parent["error"] == "remote_parent_not_found"
+
+    (ssh_server.home / "blocker").write_text("file")
+    not_a_dir, is_error = await call(app, "make_directory", connection_handle=handle, path="/blocker")
+    assert is_error is True and not_a_dir["error"] == "remote_not_a_directory"
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_returns_a_structured_error(app, monkeypatch):
+    from ssh_mcp.errors import ToolFailure
+
+    async def failing_connect(*args, **kwargs):
+        raise ToolFailure("auth_failed", stage="password", hint="密码认证失败", retryable=False)
+
+    monkeypatch.setattr(app._ssh_mcp_state.pool, "connect", failing_connect)
+
+    payload, is_error = await call(app, "connect", server_id="1")
+
+    assert is_error is True
+    assert payload["error"] == "auth_failed"
+    assert payload["stage"] == "password"
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_is_forwarded(app, monkeypatch):
+    seen = {}
+    original = app._ssh_mcp_state.pool.connect
+
+    async def recording_connect(*args, **kwargs):
+        seen.update(kwargs)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(app._ssh_mcp_state.pool, "connect", recording_connect)
+
+    await call(app, "connect", server_id="1", timeout_seconds=7.5)
+
+    assert seen["timeout"] == 7.5
+
+
+@pytest.mark.asyncio
+async def test_large_default_output_is_truncated_not_rejected(app, ssh_server, settings):
+    connect, _ = await call(app, "connect", server_id="1")
+    (ssh_server.home / "big.txt").write_bytes(b"a" * 700_000)
+
+    payload, is_error = await call(
+        app, "execute_command", connection_handle=connect["connection_handle"], command="cat big.txt"
+    )
+
+    assert is_error is False
+    assert payload["truncated"] is True
+    assert payload["stdout_total_bytes"] == 700_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    ["python3 manage.py migrate", "node build.js", "mysql -e 'select 1'", "top -b -n1"],
+)
+async def test_non_interactive_invocations_are_allowed(app, command):
+    connect, _ = await call(app, "connect", server_id="1")
+    payload, is_error = await call(
+        app, "execute_command", connection_handle=connect["connection_handle"], command=command
+    )
+    assert payload.get("error") != "interactive_command_rejected"

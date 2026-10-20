@@ -6,12 +6,10 @@ import asyncio
 import hashlib
 import os
 
-import asyncssh
 import pytest
 
-from ssh_mcp.config import PathNotAllowed
 from ssh_mcp.errors import ToolFailure
-from ssh_mcp.ssh.transfer import SftpTransferEngine, resolve_local_target
+from ssh_mcp.ssh.transfer import resolve_local_target
 
 
 @pytest.fixture
@@ -271,6 +269,63 @@ async def test_transfer_reports_progress(engine, sftp, ssh_server, settings):
 async def test_block_size_adapts_to_server_limits(engine, sftp):
     size = engine._block_size(sftp)
     assert 16 * 1024 <= size <= engine._settings.sftp_block_size
+
+
+# -- resume safety ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_same_length_stale_part_is_not_promoted(engine, sftp, ssh_server, settings):
+    """A leftover part of the same length must not be committed as the new file."""
+    data = _payload(200_000, seed=4)
+    local = settings.allowed_local_roots[0] / "same.bin"
+    local.write_bytes(data)
+    (ssh_server.home / "same.bin.part").write_bytes(b"X" * len(data))
+
+    result = await engine.upload(sftp, local, "/same.bin", verify="size")
+
+    assert result.resumed_from == 0
+    assert (ssh_server.home / "same.bin").read_bytes() == data
+
+
+@pytest.mark.asyncio
+async def test_stale_part_prefix_is_discarded_on_upload(engine, sftp, ssh_server, settings):
+    data = _payload(300_000, seed=6)
+    local = settings.allowed_local_roots[0] / "prefix.bin"
+    local.write_bytes(data)
+    (ssh_server.home / "prefix.bin.part").write_bytes(b"O" * 100_000)
+
+    result = await engine.upload(sftp, local, "/prefix.bin", verify="sha256")
+
+    assert result.resumed_from == 0
+    assert (ssh_server.home / "prefix.bin").read_bytes() == data
+
+
+@pytest.mark.asyncio
+async def test_stale_part_prefix_is_discarded_on_download(engine, sftp, ssh_server, settings):
+    remote = _payload(200_000, seed=7)
+    (ssh_server.home / "changed.bin").write_bytes(remote)
+    local = settings.allowed_local_roots[0] / "changed.bin"
+    part = local.with_name(local.name + ".part")
+    part.write_bytes(b"Z" * 50_000)
+
+    result = await engine.download(sftp, "/changed.bin", local, verify="size")
+
+    assert result.resumed_from == 0
+    assert local.read_bytes() == remote
+
+
+@pytest.mark.asyncio
+async def test_commit_without_overwrite_keeps_a_target_that_appeared(engine, sftp, ssh_server):
+    (ssh_server.home / "race.conf").write_text("newcomer")
+    (ssh_server.home / "race.conf.part").write_text("my upload")
+
+    with pytest.raises(ToolFailure) as excinfo:
+        await engine._commit(sftp, "/race.conf.part", "/race.conf", overwrite=False)
+
+    assert excinfo.value.error == "remote_exists"
+    assert (ssh_server.home / "race.conf").read_text() == "newcomer"
+    assert not (ssh_server.home / "race.conf.part").exists()
 
 
 # -- local path allowlist -----------------------------------------------------

@@ -7,7 +7,6 @@ import posixpath
 from typing import Annotated
 
 import asyncssh
-from mcp.server.mcpserver import Context
 from mcp.types import CallToolResult
 from pydantic import Field
 
@@ -178,27 +177,65 @@ class FileTools:
                     sftp = await acquired.sftp_client()
                     try:
                         existing = await sftp.stat(path)
+                    except asyncssh.SFTPNoSuchFile:
+                        existing = None
+                    if existing is not None:
                         if _entry_type(existing) == "dir":
                             return tool_ok({"path": path, "created": False, "already_existed": True})
+                        return tool_err(
+                            ToolFailure(
+                                "remote_not_a_directory",
+                                stage="mkdir",
+                                hint=f"远端已存在同名文件，无法创建目录：{path}",
+                                retryable=False,
+                                path=path,
+                            )
+                        )
+                    try:
+                        if parents:
+                            await sftp.makedirs(path, exist_ok=True)
+                        else:
+                            await sftp.mkdir(path)
                     except asyncssh.SFTPNoSuchFile:
-                        pass
-                    if parents:
-                        await sftp.makedirs(path, exist_ok=True)
-                        return tool_ok({"path": path, "created": True, "created_parents": True})
-                    await sftp.mkdir(path)
-                    return tool_ok({"path": path, "created": True, "created_parents": False})
-            except asyncssh.SFTPPermissionDenied:
-                return tool_err(
-                    ToolFailure(
-                        "permission_denied",
-                        stage="mkdir",
-                        hint=f"没有权限在远端创建目录：{path}",
-                        retryable=False,
-                        path=path,
-                    )
-                )
-            except asyncssh.SFTPFileAlreadyExists:
-                return tool_ok({"path": path, "created": False, "already_existed": True})
+                        return tool_err(
+                            ToolFailure(
+                                "remote_parent_not_found",
+                                stage="mkdir",
+                                hint=f"父目录不存在：{path}。如需一并创建，请传 parents=true。",
+                                retryable=False,
+                                path=path,
+                            )
+                        )
+                    except asyncssh.SFTPPermissionDenied:
+                        return tool_err(
+                            ToolFailure(
+                                "permission_denied",
+                                stage="mkdir",
+                                hint=f"没有权限在远端创建目录：{path}",
+                                retryable=False,
+                                path=path,
+                            )
+                        )
+                    except asyncssh.SFTPFileAlreadyExists:
+                        # Lost a race with another creator: the directory exists now.
+                        return tool_ok({"path": path, "created": False, "already_existed": True})
+                    except asyncssh.SFTPNotADirectory:
+                        return tool_err(
+                            ToolFailure(
+                                "remote_not_a_directory",
+                                stage="mkdir",
+                                hint=f"父路径中存在同名文件，无法创建目录：{path}",
+                                retryable=False,
+                                path=path,
+                            )
+                        )
+                    except asyncssh.SFTPError as exc:
+                        return tool_err(
+                            ToolFailure(
+                                "mkdir_failed", stage="mkdir", hint=f"创建目录失败：{exc}", retryable=False, path=path
+                            )
+                        )
+                    return tool_ok({"path": path, "created": True, "created_parents": parents})
             except ToolFailure as exc:
                 return tool_err(exc)
 
@@ -307,7 +344,12 @@ class FileTools:
                     if target_exists:
                         try:
                             await sftp.posix_rename(old_path, new_path)
-                        except asyncssh.SFTPError:
+                        except asyncssh.SFTPOpUnsupported:
+                            # Only the missing extension justifies the
+                            # non-atomic fallback. Any other error (source
+                            # missing, permission) must not reach the
+                            # remove-then-rename sequence: deleting the target
+                            # first would destroy it when the rename fails.
                             await sftp.remove(new_path)
                             await sftp.rename(old_path, new_path)
                     else:
@@ -386,6 +428,10 @@ async def _chmod_tree(sftp: asyncssh.SFTPClient, root: str, numeric: int) -> int
             name = entry.filename
             if isinstance(name, bytes):
                 name = name.decode("utf-8", "replace")
+            # ``scandir`` returns the server's raw entries, which include "."
+            # and ".."; following them would walk up the tree forever.
+            if name in (".", ".."):
+                continue
             child = posixpath.join(current, name)
             if _entry_type(entry.attrs) == "dir":
                 stack.append(child)

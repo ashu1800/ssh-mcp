@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from mcp.server.mcpserver import Context
 from mcp.types import CallToolResult
 from pydantic import Field
 
@@ -86,9 +85,12 @@ class ServerTools:
             except ToolFailure as exc:
                 return tool_err(exc)
 
-            entry = await self._pool.connect(
-                payload, server_id=str(server_id), compression=None
-            )
+            try:
+                entry = await self._pool.connect(
+                    payload, server_id=str(server_id), compression=None, timeout=timeout_seconds
+                )
+            except ToolFailure as exc:
+                return tool_err(exc)
             result = {
                 "connection_handle": entry.handle,
                 "status": "connected",

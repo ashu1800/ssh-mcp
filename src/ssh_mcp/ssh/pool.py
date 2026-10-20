@@ -187,6 +187,7 @@ class ConnectionPool:
         compression: str | None = None,
         server_id: str | None = None,
         force_new: bool = False,
+        timeout: float | None = None,
     ) -> PoolEntry:
         """Return a live entry for ``payload``, building it when needed."""
         key = payload.key
@@ -205,7 +206,7 @@ class ConnectionPool:
 
             chosen = compression or self._connector.compression_for_path(None)
             try:
-                result: ConnectResult = await self._connector.connect(payload, compression=chosen)
+                result: ConnectResult = await self._connector.connect(payload, compression=chosen, timeout=timeout)
             except ConnectFailure as exc:
                 raise ToolFailure(
                     exc.error,
@@ -229,10 +230,15 @@ class ConnectionPool:
             entry.compression = result.compression
             entry.warning = result.warning
             entry.sftp = None
+            previous_handle = entry.handle
             entry.handle = secrets.token_urlsafe(18)
             entry.generation += 1
             entry.touch()
             async with self._map_lock:
+                # Retire the old handle: it must not resolve to the rebuilt
+                # connection, or a stale handle could disconnect a live entry.
+                if previous_handle != entry.handle:
+                    self._by_handle.pop(previous_handle, None)
                 self._by_handle[entry.handle] = key
             return entry
 
@@ -272,7 +278,9 @@ class ConnectionPool:
         if key is None:
             raise ConnectionMissing(handle)
         entry = self._entries.get(key)
-        if entry is None:
+        # A rebuilt entry has a new handle; the old one is stale and must not
+        # be able to tear down the connection that replaced it.
+        if entry is None or entry.handle != handle:
             self._by_handle.pop(handle, None)
             raise ConnectionMissing(handle)
         async with entry.lock:

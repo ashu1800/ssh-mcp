@@ -10,7 +10,6 @@ import os
 
 import pytest
 
-from ssh_mcp.ssh.transfer import SftpTransferEngine
 
 pytestmark = [pytest.mark.large, pytest.mark.asyncio]
 

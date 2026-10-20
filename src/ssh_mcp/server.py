@@ -56,15 +56,17 @@ def _build_pool(settings: Settings) -> ConnectionPool:
 def create_server(settings: Settings, *, state: AppState | None = None) -> MCPServer:
     """Build the MCP server with every tool registered.
 
-    ``state`` may be supplied by tests; otherwise it is created from ``settings``
-    when the app starts (see :func:`run`).
+    Tools close over one :class:`AppState` for the whole process. When ``state``
+    is not supplied it is built here, once, and the lifespan manages that same
+    object -- building a second one at startup would leave the tools pointing at
+    a pool nothing ever closes.
     """
-    app_state_box: dict[str, AppState | None] = {"state": state}
+    owned_state = state or build_state(settings)
+    app_state_box: dict[str, AppState] = {"state": owned_state}
 
     @asynccontextmanager
     async def lifespan(_app: MCPServer):
-        current = app_state_box["state"] or build_state(settings)
-        app_state_box["state"] = current
+        current = app_state_box["state"]
         current.pool.start_reaper()
         logger.info(
             "ssh-mcp ready (credentials=%s, pool_idle=%.0fs, roots=%s)",
@@ -93,10 +95,8 @@ def create_server(settings: Settings, *, state: AppState | None = None) -> MCPSe
         lifespan=lifespan,
     )
 
-    creds = state.credentials if state else CredentialClient(settings)
-    conn_pool = state.pool if state else _build_pool(settings)
-    if state is None:
-        conn_pool.start_reaper()
+    creds = owned_state.credentials
+    conn_pool = owned_state.pool
     runner = CommandRunner(settings, conn_pool)
     engine = SftpTransferEngine(settings)
 
@@ -105,15 +105,21 @@ def create_server(settings: Settings, *, state: AppState | None = None) -> MCPSe
     TransferTools(app, conn_pool, engine, settings)
     FileTools(app, conn_pool, settings)
 
-    app._ssh_mcp_bundle = (creds, conn_pool)  # type: ignore[attr-defined]
+    app._ssh_mcp_state = owned_state  # type: ignore[attr-defined]
     return app
 
 
 async def shutdown_server(app: MCPServer) -> None:
-    """Release resources that :func:`create_server` created eagerly."""
-    bundle = getattr(app, "_ssh_mcp_bundle", None)
-    if not bundle:
+    """Release the resources ``create_server`` built.
+
+    Idempotent: the lifespan already closes the same objects, so this only
+    matters when the server never ran (startup error, or the transport exiting
+    before lifespan entered).
+    """
+    state = getattr(app, "_ssh_mcp_state", None)
+    if state is None:
         return
-    _creds, pool = bundle
     with contextlib.suppress(Exception):
-        await pool.aclose()
+        await state.pool.aclose()
+    with contextlib.suppress(Exception):
+        await state.credentials.aclose()
