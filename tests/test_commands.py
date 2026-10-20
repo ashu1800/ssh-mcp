@@ -113,3 +113,16 @@ async def test_unknown_handle_is_structured(runner):
         await runner.run("missing", "echo hi")
     assert excinfo.value.error == "connection_not_found"
     assert excinfo.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_returns_promptly_without_waiting_for_the_command(runner, handle, ssh_server):
+    """A timed-out command must not block until the remote process finishes."""
+    import time
+
+    started = time.monotonic()
+    result = await runner.run(handle, "sleep 30; echo never", timeout_seconds=1)
+    elapsed = time.monotonic() - started
+
+    assert result.timed_out is True
+    assert elapsed < 8, f"timeout took {elapsed:.1f}s; it must not wait for the command"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import shlex
 from dataclasses import dataclass
 
@@ -229,7 +230,20 @@ class CommandRunner:
     ) -> CommandResult:
         loop = asyncio.get_running_loop()
         started = loop.time()
-        process = await conn.create_process(command, encoding=None)
+        # ``setsid`` runs the command as the leader of its own session, so the
+        # whole tree it spawns can be killed as one process group. SSH
+        # ``signal`` requests only reach the shell, which leaves grandchildren
+        # such as ``sleep`` running after a timeout.
+        #
+        # Not every server has it (busybox images, Windows OpenSSH): the probe
+        # runs once per connection and falls back to executing the command
+        # directly, where only the channel-level controls are available.
+        marker: str | None = None
+        remote_command = command
+        if await self._supports_setsid(conn):
+            marker = f"/tmp/.ssh-mcp-{secrets.token_hex(8)}.pgid"
+            remote_command = f"setsid sh -c {shlex.quote(command)} & echo $! > {marker}; wait $!"
+        process = await conn.create_process(remote_command, encoding=None)
 
         stdout_buf = bytearray()
         stderr_buf = bytearray()
@@ -259,19 +273,23 @@ class CommandRunner:
                 await process.wait()
         except TimeoutError:
             timed_out = True
-            terminated = await self._terminate(process)
+            terminated = await self._terminate(process, conn, marker)
             logger.warning("command timed out after %.1fs; remote process terminated=%s", timeout, terminated)
         except asyncio.CancelledError:
             # Client cancelled (stdio EOF or HTTP disconnect): kill the remote
             # process, then let the cancellation propagate.
             cancelled = True
             with contextlib.suppress(Exception):
-                await asyncio.shield(self._terminate(process))
+                await asyncio.shield(self._terminate(process, conn, marker))
             raise
         finally:
             if timed_out or cancelled:
+                # ``_terminate`` closes the channel when the peer does not
+                # cooperate, so this only drains an already-closed channel.
+                # It stays bounded: a server that never acknowledges must not
+                # turn a 2-second timeout into a multi-minute hang.
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(process.wait_closed())
+                    await asyncio.shield(asyncio.wait_for(process.wait_closed(), timeout=2))
 
         duration = loop.time() - started
         exit_status = getattr(process, "exit_status", None)
@@ -302,22 +320,90 @@ class CommandRunner:
         )
         return result
 
-    async def _terminate(self, process: asyncssh.SSHClientProcess) -> bool:
-        """Terminate the remote process, escalating TERM -> KILL -> channel close."""
-        for action in (process.terminate, process.kill):
-            with contextlib.suppress(Exception):
-                action()
-            try:
-                async with asyncio.timeout(3):
-                    await process.wait()
-                return True
-            except TimeoutError:
-                continue
-            except Exception:  # noqa: BLE001
-                break
+    async def _supports_setsid(self, conn: asyncssh.SSHClientConnection) -> bool:
+        """Whether the remote can isolate a command in its own session."""
+        cached = getattr(conn, "_ssh_mcp_setsid", None)
+        if cached is not None:
+            return cached
+        try:
+            result = await asyncio.wait_for(
+                conn.run("command -v setsid >/dev/null 2>&1 && echo yes", check=False), timeout=10
+            )
+            supported = "yes" in str(result.stdout)
+        except (asyncssh.Error, OSError, TimeoutError):
+            supported = False
         with contextlib.suppress(Exception):
-            process.close()
-            async with asyncio.timeout(3):
-                await process.wait_closed()
-            return True
-        return False
+            conn._ssh_mcp_setsid = supported
+        return supported
+
+    async def _terminate(
+        self,
+        process: asyncssh.SSHClientProcess,
+        conn: asyncssh.SSHClientConnection,
+        marker: str | None,
+    ) -> bool:
+        """Stop the remote command and everything it spawned.
+
+        Signals alone are not enough: an SSH ``signal`` request reaches the
+        remote shell, not the process tree underneath it. The command runs as a
+        ``setsid`` session leader, so its group id is the session leader's pid,
+        which the wrapper wrote to ``marker``. Killing that group takes the
+        grandchildren with it. Returns whether the whole tree is gone.
+        """
+        pgid = await self._read_pgid(conn, marker) if marker else None
+        if marker is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(conn.run(f"rm -f {marker}", check=False), timeout=5)
+        if pgid is not None:
+            # Negative pid = the whole process group.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(conn.run(f"kill -TERM -{pgid}", check=False), timeout=5)
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(1.5):
+                    await process.wait()
+        # TERM to a group can be ignored; KILL cannot.
+        if pgid is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    conn.run(f"kill -KILL -{pgid} 2>/dev/null; rm -f {marker}", check=False), timeout=5
+                )
+        else:
+            # No marker (the command died before the wrapper ran): fall back to
+            # the channel-level controls.
+            for action in (process.terminate, process.kill):
+                with contextlib.suppress(Exception):
+                    action()
+                try:
+                    async with asyncio.timeout(1.5):
+                        await process.wait()
+                    break
+                except TimeoutError:
+                    continue
+                except Exception:  # noqa: BLE001
+                    break
+        process.close()
+        if await self._group_alive(conn, pgid):
+            return False
+        return True
+
+    @staticmethod
+    async def _read_pgid(conn: asyncssh.SSHClientConnection, marker: str) -> int | None:
+        """Read the group id the wrapper recorded, or ``None``."""
+        try:
+            result = await asyncio.wait_for(conn.run(f"cat {marker} 2>/dev/null", check=False), timeout=5)
+        except (asyncssh.Error, OSError, TimeoutError):
+            return None
+        try:
+            return int(str(result.stdout).strip())
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    async def _group_alive(conn: asyncssh.SSHClientConnection, pgid: int | None) -> bool:
+        if pgid is None:
+            return False
+        try:
+            result = await asyncio.wait_for(conn.run(f"kill -0 -{pgid} 2>/dev/null && echo alive", check=False), timeout=5)
+        except (asyncssh.Error, OSError, TimeoutError):
+            return False
+        return "alive" in str(result.stdout)
