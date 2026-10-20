@@ -25,3 +25,6 @@ htmlcov/
 
 # Test artefacts
 .pytest-large.log
+
+# Build output
+dist/

@@ -11,13 +11,50 @@
 
 ## 安装
 
+要求 Python ≥ 3.11。
+
+### 方式一：从源码安装（开发 / 当前机器）
+
 ```bash
+git clone https://github.com/ashu1800/ssh-mcp.git && cd ssh-mcp
 python -m venv .venv
 .venv/Scripts/python -m pip install -e ".[dev]"     # Windows
 # .venv/bin/python -m pip install -e ".[dev]"       # Linux/macOS
 ```
 
-要求 Python ≥ 3.11。
+### 方式二：装成一个普通命令（换机器时推荐）
+
+在任意一台已装好 Python 的机器上执行（仓库为私有，需要本机已配置 GitHub 凭据，
+例如 `gh auth setup-git`）：
+
+```bash
+python -m pip install --user "git+https://github.com/ashu1800/ssh-mcp.git"
+```
+
+目标机器不能访问 GitHub 时，先在本机构建 wheel 再拷过去离线安装：
+
+```bash
+python -m pip wheel --no-deps -w dist .
+# 把 dist/ssh_mcp-0.1.0-py3-none-any.whl 拷到目标机
+python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
+```
+
+安装后会得到 `ssh-mcp` 命令（Windows 为 `ssh-mcp.exe`）。客户端配置里就可以直接写这个命令，
+不必再关心仓库路径与虚拟环境位置：
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "ssh-mcp",
+      "args": ["--transport", "stdio"],
+      "env": { "MCP_KEY": "mcp_xxx" }
+    }
+  }
+}
+```
+
+用 `ssh-mcp --help` 可确认命令可用；`python -m ssh_mcp` 在没有把 Scripts 目录加入 PATH 时是等价写法。
 
 ## 配置
 
@@ -39,6 +76,9 @@ python -m venv .venv
 全部变量见 `.env.example`。
 
 ## 客户端配置
+
+`command` 必须是**绝对路径或 PATH 中的可执行文件名**——MCP 客户端不会继承你终端里的虚拟环境激活状态。
+源码安装写 venv 里解释器的绝对路径，pip 安装则直接写 `ssh-mcp`。
 
 ### Claude Code / Claude Desktop
 
