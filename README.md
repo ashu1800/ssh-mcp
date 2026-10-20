@@ -77,11 +77,19 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 
 ## 一键安装并接入客户端
 
+先取得代码（仓库为私有，需要已配置 GitHub 凭据，例如 `gh auth setup-git`）：
+
+```bash
+git clone https://github.com/ashu1800/ssh-mcp.git && cd ssh-mcp
+```
+
+然后一条命令安装并接入本机所有已安装的 MCP 客户端：
+
 ```bash
 python scripts/install.py --mcp-key mcp_xxx
 ```
 
-它会安装本仓库、把 `ssh-mcp` 写进本机已安装的 MCP 客户端，并验证命令能启动：
+已经 clone 过的机器上不用重复拉取，直接在仓库目录里跑第二条即可。脚本会安装本仓库、把 `ssh-mcp` 写进客户端，并验证命令能启动：
 
 - **Claude Code**：优先调用 `claude mcp add -s user`，没有 CLI 时改 `~/.claude.json`
 - **Claude Desktop**：标准版 `%APPDATA%\Claude`，3p 版 `%LOCALAPPDATA%\Claude-3p`
