@@ -75,6 +75,22 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 
 全部变量见 `.env.example`。
 
+## 一键安装并接入客户端
+
+```bash
+python scripts/install.py --mcp-key mcp_xxx
+```
+
+它会安装本仓库、把 `ssh-mcp` 写进本机已安装的 MCP 客户端，并验证命令能启动：
+
+- **Claude Code**：优先调用 `claude mcp add -s user`，没有 CLI 时改 `~/.claude.json`
+- **Claude Desktop**：标准版 `%APPDATA%\Claude`，3p 版 `%LOCALAPPDATA%\Claude-3p`
+- **Cursor**：`~/.cursor/mcp.json`
+- **VS Code / 通义灵码**：`%APPDATA%\Code\User\mcp.json`（`servers` 键）
+
+`--dry-run` 只报告会改哪些文件；`--skip-install` 只写配置；`--clients claude,cursor` 限定目标；
+`--from-wheel dist/xxx.whl` 在离线机器上安装。改动前会留 `.bak`，检测不到客户端的配置不会被创建。
+
 ## 客户端配置
 
 `command` 必须是**绝对路径或 PATH 中的可执行文件名**——MCP 客户端不会继承你终端里的虚拟环境激活状态。
