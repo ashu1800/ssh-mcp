@@ -11,26 +11,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx2
 
 from ssh_mcp.config import Settings
-from ssh_mcp.crypto.blob_decryptor import DecryptFailed, decrypt_blob
+from ssh_mcp.crypto.blob_decryptor import decrypt_blob
 from ssh_mcp.errors import ToolFailure
 from ssh_mcp.models import CredentialPayload, ServerSummary
 
 logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS = {500, 502, 503, 504}
+# How long a failed fetch is shared before another attempt is allowed.
+_FAILURE_TTL = 10.0
 
 
 @dataclass
 class _CacheEntry:
     fetched_at: float
     servers: list[dict[str, Any]]
-    crypto: dict[str, Any] = field(default_factory=dict)
 
 
 class CredentialServiceError(ToolFailure):
@@ -47,6 +48,8 @@ class CredentialClient:
         self._settings = settings
         self._cache: _CacheEntry | None = None
         self._lock = asyncio.Lock()
+        self._last_failure: CredentialServiceError | None = None
+        self._last_failure_at = 0.0
         self._client = httpx2.AsyncClient(
             timeout=httpx2.Timeout(settings.credentials_timeout),
             transport=transport,
@@ -83,9 +86,12 @@ class CredentialClient:
         (a server added or re-keyed since the last fetch), then fails with
         ``server_not_found``.
         """
+        started = time.monotonic()
         entry = await self._fetch(refresh=refresh)
         blob = self._find_blob(entry, server_id)
-        if blob is None and not refresh:
+        # Only re-download when the answer came from a cache that predates this
+        # call; a cache that was cold or expired was fetched just now.
+        if blob is None and not refresh and entry.fetched_at < started:
             entry = await self._fetch(refresh=True)
             blob = self._find_blob(entry, server_id)
         if blob is None:
@@ -95,29 +101,8 @@ class CredentialClient:
                 retryable=True,
                 server_id=server_id,
             )
-        try:
-            return decrypt_blob(self._settings.mcp_key, blob)
-        except DecryptFailed as exc:
-            raise ToolFailure(
-                "decrypt_failed",
-                stage="decrypt",
-                hint=exc.to_dict()["hint"],
-                retryable=False,
-                server_id=server_id,
-            ) from None
-
-    async def get_credential_for_blob(self, server_id: str, blob: dict[str, Any]) -> CredentialPayload:
-        """Decrypt an already-fetched blob (used by tests and the live probe)."""
-        try:
-            return decrypt_blob(self._settings.mcp_key, blob)
-        except DecryptFailed as exc:
-            raise ToolFailure(
-                "decrypt_failed",
-                stage="decrypt",
-                hint=exc.to_dict()["hint"],
-                retryable=False,
-                server_id=server_id,
-            ) from None
+        # ``DecryptFailed`` is already a ``ToolFailure``; let it through as-is.
+        return decrypt_blob(self._settings.mcp_key, blob)
 
     # -- internals ------------------------------------------------------------
 
@@ -146,8 +131,19 @@ class CredentialClient:
             # Another caller may have refreshed while we waited for the lock.
             if not refresh and self._cache_valid(self._cache):
                 return self._cache  # type: ignore[return-value]
-            entry = await self._request_with_retry()
+            if not refresh and self._last_failure is not None and (time.monotonic() - self._last_failure_at) < _FAILURE_TTL:
+                # Waiters that piled up behind a failing fetch must not each run
+                # their own retry/backoff sequence; share the failure briefly.
+                raise self._last_failure
+            try:
+                entry = await self._request_with_retry()
+            except CredentialServiceError as exc:
+                if exc.retryable:
+                    self._last_failure = exc
+                    self._last_failure_at = time.monotonic()
+                raise
             self._cache = entry
+            self._last_failure = None
             return entry
 
     async def _request_with_retry(self) -> _CacheEntry:
@@ -236,7 +232,6 @@ class CredentialClient:
         return _CacheEntry(
             fetched_at=time.monotonic(),
             servers=[item for item in servers if isinstance(item, dict)],
-            crypto=data.get("crypto") if isinstance(data.get("crypto"), dict) else {},
         )
 
 

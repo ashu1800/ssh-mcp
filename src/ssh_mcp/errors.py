@@ -68,3 +68,16 @@ class ConnectionMissing(ToolFailure):
             retryable=True,
             connection_handle=handle,
         )
+
+
+def validate_remote_path(path: str, field: str = "path") -> str:
+    """Reject an unusable remote path before it reaches SFTP.
+
+    One owner for the rule: ``tools/files.py``, the transfer engine, and command
+    execution all funnel through here so the wording and ordering cannot drift.
+    """
+    if not path or not path.strip():
+        raise ToolFailure("invalid_argument", stage="validate", hint=f"{field} 不能为空。", retryable=False)
+    if "\x00" in path:
+        raise ToolFailure("invalid_argument", stage="validate", hint=f"{field} 不能包含 NUL 字符。", retryable=False)
+    return path

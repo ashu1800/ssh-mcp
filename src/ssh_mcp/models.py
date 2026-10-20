@@ -64,10 +64,6 @@ class CredentialPayload(BaseModel):
         """Connection-pool identity: (host, port, username)."""
         return (self.host, self.port, self.username)
 
-    @property
-    def auth_method(self) -> str:
-        return "private_key" if self.auth.type == "private_key" else "password"
-
     def redacted_summary(self) -> dict[str, Any]:
         """Fields safe to return to an AI client."""
         summary: dict[str, Any] = {

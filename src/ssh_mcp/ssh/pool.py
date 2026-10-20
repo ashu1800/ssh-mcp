@@ -43,8 +43,6 @@ class PoolEntry:
     warning: str | None = None
     in_flight: int = 0
     last_used: float = field(default_factory=time.monotonic)
-    created_at: float = field(default_factory=time.monotonic)
-    generation: int = 0
 
     @property
     def host(self) -> str:
@@ -67,17 +65,11 @@ class PoolEntry:
 
 @dataclass
 class Acquired:
-    """A borrowed pool entry, usable as an async context manager."""
+    """A borrowed pool entry; release it through :func:`borrow`."""
 
     entry: PoolEntry
     conn: asyncssh.SSHClientConnection
     _pool: "ConnectionPool"
-
-    async def __aenter__(self) -> "Acquired":
-        return self
-
-    async def __aexit__(self, *exc_info) -> None:
-        self._pool.release(self.entry)
 
     async def sftp_client(self) -> asyncssh.SFTPClient:
         return await self._pool.sftp_for(self.entry)
@@ -184,7 +176,6 @@ class ConnectionPool:
         self,
         payload: CredentialPayload,
         *,
-        compression: str | None = None,
         server_id: str | None = None,
         force_new: bool = False,
         timeout: float | None = None,
@@ -204,17 +195,10 @@ class ConnectionPool:
             if entry.is_alive() and force_new:
                 await self._close_entry(entry)
 
-            chosen = compression or self._connector.compression_for_path(None)
             try:
-                result: ConnectResult = await self._connector.connect(payload, compression=chosen, timeout=timeout)
-            except ConnectFailure as exc:
-                raise ToolFailure(
-                    exc.error,
-                    stage=exc.stage,
-                    hint=exc.hint,
-                    retryable=exc.retryable,
-                    **exc.details,
-                ) from None
+                result: ConnectResult = await self._connector.connect(payload, timeout=timeout)
+            except ConnectFailure:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise ToolFailure(
                     "connect_failed",
@@ -232,7 +216,6 @@ class ConnectionPool:
             entry.sftp = None
             previous_handle = entry.handle
             entry.handle = secrets.token_urlsafe(18)
-            entry.generation += 1
             entry.touch()
             async with self._map_lock:
                 # Retire the old handle: it must not resolve to the rebuilt
@@ -289,10 +272,6 @@ class ConnectionPool:
                 self._by_handle.pop(entry.handle, None)
             await self._close_entry(entry)
         return key
-
-    def handle_for_key(self, key: tuple[str, int, str]) -> str | None:
-        entry = self._entries.get(key)
-        return entry.handle if entry and entry.is_alive() else None
 
     def stats(self) -> dict:
         entries = []

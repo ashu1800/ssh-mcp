@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import posixpath
 from typing import Annotated
@@ -10,14 +11,15 @@ import asyncssh
 from mcp.types import CallToolResult
 from pydantic import Field
 
-from ssh_mcp.errors import ConfirmationRequired, ToolFailure
+from ssh_mcp.errors import ConfirmationRequired, ToolFailure, validate_remote_path
 from ssh_mcp.ssh.pool import ConnectionPool, borrow
+from ssh_mcp.ssh.sftp_ops import replace_file
 from ssh_mcp.tools.helpers import tool_err, tool_ok
 
 logger = logging.getLogger(__name__)
 
 
-def _validate_remote(path: str, field: str = "path") -> str:
+def validate_remote_path(path: str, field: str = "path") -> str:
     if not path or not path.strip():
         raise ToolFailure("invalid_argument", stage="validate", hint=f"{field} 不能为空。", retryable=False)
     if "\x00" in path:
@@ -88,12 +90,14 @@ class FileTools:
             limit = max_entries or self._settings.directory_page_limit
             limit = max(1, min(limit, 10_000))
             try:
-                _validate_remote(path)
+                validate_remote_path(path)
                 async with borrow(self._pool, connection_handle) as acquired:
                     sftp = await acquired.sftp_client()
                     entries: list[dict] = []
                     total = 0
                     base = path.rstrip("/") or "/"
+                    # The page is filled at ``limit``; keep counting so that
+                    # ``total`` stays the real entry count.
                     async for entry in sftp.scandir(path):
                         name = entry.filename
                         if isinstance(name, bytes):
@@ -128,7 +132,8 @@ class FileTools:
             except ToolFailure as exc:
                 return tool_err(exc)
             entries.sort(key=lambda item: (item["type"] != "dir", item["name"].lower()))
-            return tool_ok({"path": path, "entries": entries, "total": total, "truncated": total > len(entries)})
+            truncated = total > len(entries)
+            return tool_ok({"path": path, "entries": entries, "total": total, "truncated": truncated})
 
         @app.tool(
             name="stat_file",
@@ -145,7 +150,7 @@ class FileTools:
             Use when 需要确认文件是否存在、大小或权限是否符合预期，或在传输前核对目标状态时。
             """
             try:
-                _validate_remote(path)
+                validate_remote_path(path)
                 async with borrow(self._pool, connection_handle) as acquired:
                     sftp = await acquired.sftp_client()
                     attrs = await sftp.stat(path, follow_symlinks=follow_symlinks)
@@ -172,7 +177,7 @@ class FileTools:
             Use when 需要为上传、日志或发布产物准备远端目录时。
             """
             try:
-                _validate_remote(path)
+                validate_remote_path(path)
                 async with borrow(self._pool, connection_handle) as acquired:
                     sftp = await acquired.sftp_client()
                     try:
@@ -260,7 +265,7 @@ class FileTools:
             if not confirm:
                 return tool_err(ConfirmationRequired("remove_path", consequence, path=path, recursive=recursive))
             try:
-                _validate_remote(path)
+                validate_remote_path(path)
                 async with borrow(self._pool, connection_handle) as acquired:
                     sftp = await acquired.sftp_client()
                     attrs = await sftp.stat(path, follow_symlinks=False)
@@ -321,8 +326,8 @@ class FileTools:
                     )
                 )
             try:
-                _validate_remote(old_path, "old_path")
-                _validate_remote(new_path, "new_path")
+                validate_remote_path(old_path, "old_path")
+                validate_remote_path(new_path, "new_path")
                 async with borrow(self._pool, connection_handle) as acquired:
                     sftp = await acquired.sftp_client()
                     target_exists = False
@@ -342,16 +347,7 @@ class FileTools:
                             )
                         )
                     if target_exists:
-                        try:
-                            await sftp.posix_rename(old_path, new_path)
-                        except asyncssh.SFTPOpUnsupported:
-                            # Only the missing extension justifies the
-                            # non-atomic fallback. Any other error (source
-                            # missing, permission) must not reach the
-                            # remove-then-rename sequence: deleting the target
-                            # first would destroy it when the rename fails.
-                            await sftp.remove(new_path)
-                            await sftp.rename(old_path, new_path)
+                        await replace_file(sftp, old_path, new_path)
                     else:
                         await sftp.rename(old_path, new_path)
             except asyncssh.SFTPNoSuchFile:
@@ -393,7 +389,7 @@ class FileTools:
                     )
                 )
             try:
-                _validate_remote(path)
+                validate_remote_path(path)
                 numeric = _parse_mode(mode)
                 async with borrow(self._pool, connection_handle) as acquired:
                     sftp = await acquired.sftp_client()
@@ -417,13 +413,20 @@ class FileTools:
 
 
 async def _chmod_tree(sftp: asyncssh.SFTPClient, root: str, numeric: int) -> int:
-    """Apply ``numeric`` to ``root`` and everything below it; returns the count."""
+    """Apply ``numeric`` to ``root`` and everything below it; returns the count.
+
+    Each directory costs one ``scandir`` plus one pipelined ``chmod`` batch for
+    its files; awaiting every entry individually made a deep tree cost one
+    network round trip per file.
+    """
     count = 0
     stack = [root]
     while stack:
         current = stack.pop()
         await sftp.chmod(current, numeric)
         count += 1
+        files: list[str] = []
+        dirs: list[str] = []
         async for entry in sftp.scandir(current):
             name = entry.filename
             if isinstance(name, bytes):
@@ -433,11 +436,11 @@ async def _chmod_tree(sftp: asyncssh.SFTPClient, root: str, numeric: int) -> int
             if name in (".", ".."):
                 continue
             child = posixpath.join(current, name)
-            if _entry_type(entry.attrs) == "dir":
-                stack.append(child)
-            else:
-                await sftp.chmod(child, numeric)
-                count += 1
+            (dirs if _entry_type(entry.attrs) == "dir" else files).append(child)
+        if files:
+            await asyncio.gather(*(sftp.chmod(child, numeric) for child in files))
+            count += len(files)
+        stack.extend(dirs)
     return count
 
 

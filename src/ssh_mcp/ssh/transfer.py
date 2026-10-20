@@ -31,7 +31,8 @@ from pathlib import Path
 import asyncssh
 
 from ssh_mcp.config import PathNotAllowed, Settings
-from ssh_mcp.errors import ToolFailure
+from ssh_mcp.errors import ToolFailure, validate_remote_path
+from ssh_mcp.ssh.sftp_ops import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,6 @@ class _ProgressReporter:
     def __init__(self, callback: ProgressFn | None, total: int | None) -> None:
         self._callback = callback
         self._total = total
-        self._last_bytes = 0
         self._last_report_at = 0.0
         self._last_pct = -1
         self._started = time.monotonic()
@@ -155,7 +155,7 @@ class SftpTransferEngine:
         conn: asyncssh.SSHClientConnection | None = None,
     ) -> TransferResult:
         started = time.monotonic()
-        remote_path = _validate_remote_path(remote_path)
+        remote_path = validate_remote_path(remote_path)
         if not local_path.is_file():
             raise ToolFailure(
                 "local_file_missing",
@@ -294,7 +294,7 @@ class SftpTransferEngine:
         conn: asyncssh.SSHClientConnection | None = None,
     ) -> TransferResult:
         started = time.monotonic()
-        remote_path = _validate_remote_path(remote_path)
+        remote_path = validate_remote_path(remote_path)
         if local_path.exists() and not overwrite:
             raise ToolFailure(
                 "local_exists",
@@ -480,43 +480,65 @@ class SftpTransferEngine:
         local_path: Path,
         conn: asyncssh.SSHClientConnection | None = None,
     ) -> tuple[int, bool]:
-        """Decide where a resumed upload continues from.
+        """Upload-side resume plan: remote ``.part`` vs the local source."""
+        remote = _RemotePart(sftp, part_path, conn)
+        return await self._plan_part(
+            remote,
+            _stat_remote_part,
+            source_size,
+            resume=resume,
+            prefix_matches=lambda size: self._prefix_matches(local_path, remote, size),
+        )
+
+    async def _plan_resume_local(
+        self,
+        part_path: Path,
+        source_size: int,
+        *,
+        resume: bool,
+        sftp: asyncssh.SFTPClient,
+        remote_path: str,
+        conn: asyncssh.SSHClientConnection | None = None,
+    ) -> tuple[int, bool]:
+        """Download-side resume plan: local ``.part`` vs the remote file."""
+        remote = _RemotePart(sftp, remote_path, conn)
+        return await self._plan_part(
+            _LocalPart(part_path),
+            _stat_local_part,
+            source_size,
+            resume=resume,
+            prefix_matches=lambda size: self._prefix_matches(part_path, remote, size),
+        )
+
+    async def _plan_part(self, part, stat_part, source_size: int, *, resume: bool, prefix_matches) -> tuple[int, bool]:
+        """Shared decision ladder for both directions.
 
         A leftover ``.part`` is only trusted after its bytes are compared with
-        the source prefix: its length alone does not prove it belongs to *this*
-        file, and a stale part of the same length used to be promoted verbatim
-        as the uploaded content. When the prefix cannot be checked cheaply the
-        part is discarded and the upload restarts.
+        the source: its length alone does not prove it belongs to *this* file,
+        and trusting it promoted stale content (upload) or spliced old bytes
+        onto a changed file (download) while the size check still passed.
         """
-        exists, size = await _stat_size(sftp, part_path)
+        exists, size = await stat_part(part)
         if not exists:
             return 0, False
         if not resume or size <= 0:
-            await sftp.remove(part_path)
+            await part.remove()
             return 0, False
         if size > source_size:
-            await sftp.remove(part_path)
+            await part.remove()
             return 0, True
-        if await self._part_matches_source(sftp, part_path, local_path, size, conn):
+        if await prefix_matches(size):
             return size, False
-        logger.info("discarding stale partial upload %s (prefix does not match the source)", part_path)
-        await sftp.remove(part_path)
-        return 0, size > 0
+        logger.info("discarding stale partial transfer %s (prefix does not match)", part)
+        await part.remove()
+        return 0, True
 
-    async def _part_matches_source(
-        self,
-        sftp: asyncssh.SFTPClient,
-        part_path: str,
-        local_path: Path,
-        size: int,
-        conn: asyncssh.SSHClientConnection | None,
-    ) -> bool:
-        """Whether the first ``size`` bytes of the local file match the remote part."""
-        remote_digest = await self._sha256_prefix_remote(sftp, part_path, size, conn)
+    async def _prefix_matches(self, local_path: Path, remote: _RemotePart, size: int) -> bool:
+        """Whether the first ``size`` bytes of ``local_path`` equal the remote file's."""
+        remote_digest = await self._sha256_prefix_remote(remote.sftp, remote.path, size, remote.conn)
         if remote_digest is None:
             return False
-        local_digest = await asyncio.to_thread(_sha256_prefix_local, local_path, size)
-        return local_digest == remote_digest
+        return await asyncio.to_thread(_sha256_prefix_local, local_path, size) == remote_digest
 
     async def _sha256_prefix_remote(
         self,
@@ -527,17 +549,9 @@ class SftpTransferEngine:
     ) -> str | None:
         """Hash the first ``size`` bytes of a remote file, or ``None`` if unavailable."""
         if conn is not None:
-            quoted = shlex.quote(path)
-            command = f"head -c {int(size)} -- {quoted} | sha256sum"
-            try:
-                async with asyncio.timeout(120):
-                    result = await conn.run(command, check=False)
-            except (asyncssh.Error, OSError, TimeoutError):
-                result = None
-            if result is not None and result.exit_status == 0 and result.stdout:
-                digest = str(result.stdout).strip().split()[0].lower()
-                if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
-                    return digest
+            digest = await _remote_sha256_command(conn, f"head -c {int(size)} -- {shlex.quote(path)} | sha256sum")
+            if digest is not None:
+                return digest
         try:
             digest = hashlib.sha256()
             async with sftp.open(path, "rb", encoding=None, block_size=1024 * 1024, max_requests=32) as handle:
@@ -551,40 +565,6 @@ class SftpTransferEngine:
             return digest.hexdigest()
         except (asyncssh.SFTPError, OSError):
             return None
-
-    async def _plan_resume_local(
-        self,
-        part_path: Path,
-        source_size: int,
-        *,
-        resume: bool,
-        sftp: asyncssh.SFTPClient,
-        remote_path: str,
-        conn: asyncssh.SSHClientConnection | None = None,
-    ) -> tuple[int, bool]:
-        """Decide where a resumed download continues from.
-
-        As with uploads, the local ``.part`` prefix is compared against the
-        remote file before it is kept: the remote file may have been rewritten
-        between attempts, and trusting the length alone spliced old bytes onto
-        new ones while the size check still passed.
-        """
-        if not part_path.is_file():
-            return 0, False
-        size = await asyncio.to_thread(lambda: part_path.stat().st_size)
-        if not resume or size <= 0:
-            await asyncio.to_thread(part_path.unlink, True)
-            return 0, False
-        if size > source_size:
-            await asyncio.to_thread(part_path.unlink, True)
-            return 0, True
-        local_digest = await asyncio.to_thread(_sha256_prefix_local, part_path, size)
-        remote_digest = await self._sha256_prefix_remote(sftp, remote_path, size, conn)
-        if remote_digest is not None and local_digest == remote_digest:
-            return size, False
-        logger.info("discarding stale partial download %s (prefix does not match the remote file)", part_path)
-        await asyncio.to_thread(part_path.unlink, True)
-        return 0, size > 0
 
     async def _commit(self, sftp: asyncssh.SFTPClient, part_path: str, target: str, *, overwrite: bool) -> bool:
         """Atomically promote ``.part`` to its final name. Returns whether it was atomic.
@@ -626,14 +606,7 @@ class SftpTransferEngine:
                     remote_path=target,
                 ) from None
         try:
-            await sftp.posix_rename(part_path, target)
-            return True
-        except asyncssh.SFTPOpUnsupported:
-            logger.warning("posix-rename unavailable for %s; falling back to remove+rename", target)
-            with contextlib.suppress(asyncssh.SFTPNoSuchFile):
-                await sftp.remove(target)
-            await sftp.rename(part_path, target)
-            return False
+            return await replace_file(sftp, part_path, target)
         except asyncssh.SFTPError as exc:
             await self._delete_quietly(sftp, part_path)
             raise ToolFailure(
@@ -722,6 +695,41 @@ class SftpTransferEngine:
         )
 
 
+@dataclass
+class _RemotePart:
+    sftp: asyncssh.SFTPClient
+    path: str
+    conn: asyncssh.SSHClientConnection | None
+
+    async def remove(self) -> None:
+        with contextlib.suppress(asyncssh.SFTPError):
+            await self.sftp.remove(self.path)
+
+    def __str__(self) -> str:
+        return self.path
+
+
+@dataclass
+class _LocalPart:
+    path: Path
+
+    async def remove(self) -> None:
+        await asyncio.to_thread(self.path.unlink, True)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+
+async def _stat_remote_part(part: _RemotePart) -> tuple[bool, int]:
+    return await _stat_size(part.sftp, part.path)
+
+
+async def _stat_local_part(part: _LocalPart) -> tuple[bool, int]:
+    if not part.path.is_file():
+        return False, 0
+    return True, await asyncio.to_thread(lambda: part.path.stat().st_size)
+
+
 class _TotalTimeout(Exception):
     """The configured total transfer budget was exhausted."""
 
@@ -729,7 +737,7 @@ class _TotalTimeout(Exception):
 # -- module helpers -----------------------------------------------------------
 
 
-def _validate_remote_path(path: str) -> str:
+def validate_remote_path(path: str) -> str:
     if not path or not path.strip():
         raise ToolFailure("invalid_argument", stage="validate", hint="远端路径不能为空。", retryable=False)
     if "\x00" in path:
@@ -800,15 +808,23 @@ async def _sha256_remote_command(conn: asyncssh.SSHClientConnection, path: str) 
     """Run ``sha256sum`` (or ``shasum -a 256`` on BSD/macOS) on the remote."""
     quoted = shlex.quote(path)
     for command in (f"sha256sum -- {quoted}", f"shasum -a 256 -- {quoted}"):
-        try:
-            async with asyncio.timeout(300):
-                result = await conn.run(command, check=False)
-        except (asyncssh.Error, OSError, TimeoutError):
-            continue
-        if result.exit_status == 0 and result.stdout:
-            digest = str(result.stdout).strip().split()[0].lower()
-            if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
-                return digest
+        digest = await _remote_sha256_command(conn, command)
+        if digest is not None:
+            return digest
+    return None
+
+
+async def _remote_sha256_command(conn: asyncssh.SSHClientConnection, command: str) -> str | None:
+    """Run one hashing command and return its 64-hex digest, or ``None``."""
+    try:
+        async with asyncio.timeout(300):
+            result = await conn.run(command, check=False)
+    except (asyncssh.Error, OSError, TimeoutError):
+        return None
+    if result.exit_status == 0 and result.stdout:
+        digest = str(result.stdout).strip().split()[0].lower()
+        if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            return digest
     return None
 
 

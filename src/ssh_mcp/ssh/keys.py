@@ -41,10 +41,6 @@ class KeyStore:
     def __init__(self, keys_dir: Path) -> None:
         self._dir = keys_dir
 
-    @property
-    def directory(self) -> Path:
-        return self._dir
-
     def path_for(self, host: str, port: int, username: str) -> Path:
         return self._dir / f"{key_id_for(host, port, username)}.key"
 
@@ -71,13 +67,6 @@ class KeyStore:
         _chmod(path, 0o600)
         logger.info("generated Ed25519 key for %s@%s:%s", username, host, port)
         return key
-
-    def delete(self, host: str, port: int, username: str) -> None:
-        path = self.path_for(host, port, username)
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:  # pragma: no cover
-            logger.warning("could not delete local key %s", path)
 
 
 def public_key_line(key: asyncssh.SSHKey) -> str:

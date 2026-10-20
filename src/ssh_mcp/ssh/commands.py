@@ -11,8 +11,8 @@ from dataclasses import dataclass
 import asyncssh
 
 from ssh_mcp.config import Settings
-from ssh_mcp.errors import ToolFailure
-from ssh_mcp.ssh.pool import ConnectionPool
+from ssh_mcp.errors import ToolFailure, validate_remote_path
+from ssh_mcp.ssh.pool import ConnectionPool, borrow
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +177,7 @@ class CommandRunner:
         max_output_bytes: int | None = None,
         allow_interactive: bool = False,
     ) -> CommandResult:
-        if not command or not command.strip():
-            raise ToolFailure("invalid_argument", stage="validate", hint="command 不能为空。", retryable=False)
-        if "\x00" in command:
-            raise ToolFailure(
-                "invalid_argument", stage="validate", hint="command 不能包含 NUL 字符。", retryable=False
-            )
+        validate_remote_path(command, "command")
         if not allow_interactive:
             offender = _interactive_reason(command)
             if offender is not None:
@@ -205,9 +200,9 @@ class CommandRunner:
         if cap < 1024:
             raise ToolFailure("invalid_argument", stage="validate", hint="max_output_bytes 至少为 1024。", retryable=False)
 
-        acquired = await self._pool.acquire(handle)
         try:
-            return await self._execute(acquired.conn, command, timeout=timeout, cap=cap)
+            async with borrow(self._pool, handle) as acquired:
+                return await self._execute(acquired.conn, command, timeout=timeout, cap=cap)
         except ToolFailure:
             raise
         except (asyncssh.ChannelOpenError, asyncssh.ConnectionLost, ConnectionError, OSError) as exc:
@@ -223,8 +218,6 @@ class CommandRunner:
                 connection_handle=handle,
                 detail=type(exc).__name__,
             ) from None
-        finally:
-            self._pool.release(acquired.entry)
 
     async def _execute(
         self,

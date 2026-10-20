@@ -62,11 +62,10 @@ def create_server(settings: Settings, *, state: AppState | None = None) -> MCPSe
     a pool nothing ever closes.
     """
     owned_state = state or build_state(settings)
-    app_state_box: dict[str, AppState] = {"state": owned_state}
 
     @asynccontextmanager
     async def lifespan(_app: MCPServer):
-        current = app_state_box["state"]
+        current = owned_state
         current.pool.start_reaper()
         logger.info(
             "ssh-mcp ready (credentials=%s, pool_idle=%.0fs, roots=%s)",

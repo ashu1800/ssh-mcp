@@ -87,7 +87,7 @@ class ServerTools:
 
             try:
                 entry = await self._pool.connect(
-                    payload, server_id=str(server_id), compression=None, timeout=timeout_seconds
+                    payload, server_id=str(server_id), timeout=timeout_seconds
                 )
             except ToolFailure as exc:
                 return tool_err(exc)

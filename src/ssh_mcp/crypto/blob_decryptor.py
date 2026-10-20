@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from pydantic import ValidationError
 
+from ssh_mcp.errors import ToolFailure
 from ssh_mcp.models import CredentialPayload
 
 logger = logging.getLogger(__name__)
@@ -36,21 +37,28 @@ AAD_TEMPLATE = "basic-server-ops/credential/v1|server={server_id}"
 KEY_LENGTH = 32
 
 
-class DecryptFailed(Exception):
-    """The blob could not be decrypted or did not contain a usable payload."""
+DECRYPT_FAILED_HINT = "加密负载无法解密，请检查 MCP 密钥是否有效或联系服务器管理服务重新签发"
+
+
+class DecryptFailed(ToolFailure):
+    """The blob could not be decrypted or did not contain a usable payload.
+
+    Already a :class:`ToolFailure`, so the credential client re-raises it
+    unchanged instead of rebuilding the error dict.
+    """
 
     def __init__(self, server_id: str) -> None:
-        super().__init__("decrypt_failed")
+        super().__init__(
+            "decrypt_failed",
+            stage="decrypt",
+            hint=DECRYPT_FAILED_HINT,
+            retryable=False,
+            server_id=server_id,
+        )
         self.server_id = server_id
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "error": "decrypt_failed",
-            "stage": "decrypt",
-            "server_id": self.server_id,
-            "hint": "加密负载无法解密，请检查 MCP 密钥是否有效或联系服务器管理服务重新签发",
-            "retryable": False,
-        }
+    def __str__(self) -> str:
+        return "decrypt_failed"
 
 
 def derive_key(token: str, server_id: str) -> bytes:

@@ -11,7 +11,7 @@ from mcp.types import CallToolResult
 from pydantic import BaseModel, Field
 
 from ssh_mcp.errors import ConfirmationRequired, ToolFailure
-from ssh_mcp.ssh.pool import ConnectionPool
+from ssh_mcp.ssh.pool import ConnectionPool, borrow
 from ssh_mcp.ssh.transfer import SftpTransferEngine, resolve_local_target
 from ssh_mcp.tools.helpers import tool_err, tool_ok
 
@@ -69,26 +69,21 @@ class TransferTools:
                 )
             try:
                 local = resolve_local_target(self._settings, local_path)
-                acquired = await self._pool.acquire(connection_handle)
+                async with borrow(self._pool, connection_handle) as acquired:
+                    sftp = await acquired.sftp_client()
+                    result = await self._engine.upload(
+                        sftp,
+                        local,
+                        remote_path,
+                        overwrite=overwrite,
+                        resume=resume,
+                        verify=verify,
+                        create_parent_dirs=create_parent_dirs,
+                        progress=self._progress_fn(ctx, progress),
+                        conn=acquired.conn,
+                    )
             except ToolFailure as exc:
                 return tool_err(exc)
-            try:
-                sftp = await acquired.sftp_client()
-                result = await self._engine.upload(
-                    sftp,
-                    local,
-                    remote_path,
-                    overwrite=overwrite,
-                    resume=resume,
-                    verify=verify,
-                    create_parent_dirs=create_parent_dirs,
-                    progress=self._progress_fn(ctx, progress),
-                    conn=acquired.conn,
-                )
-            except ToolFailure as exc:
-                return tool_err(exc)
-            finally:
-                self._pool.release(acquired.entry)
             return tool_ok(result.to_dict())
 
         @app.tool(
@@ -128,25 +123,20 @@ class TransferTools:
                 )
             try:
                 local = resolve_local_target(self._settings, local_path)
-                acquired = await self._pool.acquire(connection_handle)
+                async with borrow(self._pool, connection_handle) as acquired:
+                    sftp = await acquired.sftp_client()
+                    result = await self._engine.download(
+                        sftp,
+                        remote_path,
+                        local,
+                        overwrite=overwrite,
+                        resume=resume,
+                        verify=verify,
+                        progress=self._progress_fn(ctx, progress),
+                        conn=acquired.conn,
+                    )
             except ToolFailure as exc:
                 return tool_err(exc)
-            try:
-                sftp = await acquired.sftp_client()
-                result = await self._engine.download(
-                    sftp,
-                    remote_path,
-                    local,
-                    overwrite=overwrite,
-                    resume=resume,
-                    verify=verify,
-                    progress=self._progress_fn(ctx, progress),
-                    conn=acquired.conn,
-                )
-            except ToolFailure as exc:
-                return tool_err(exc)
-            finally:
-                self._pool.release(acquired.entry)
             return tool_ok(result.to_dict())
 
         @app.tool(
@@ -269,9 +259,11 @@ class TransferTools:
         async def one(index: int, pair: FilePair) -> None:
             async with semaphore:
                 try:
+                    local = resolve_local_target(self._settings, pair.local_path)
+                    sftp = await acquired.sftp_client()
+                    # Both engine methods take (sftp, local, remote) opposite
+                    # ways; normalise once so the branch cannot swap them.
                     if direction == "upload":
-                        local = resolve_local_target(self._settings, pair.local_path)
-                        sftp = await acquired.sftp_client()
                         result = await self._engine.upload(
                             sftp,
                             local,
@@ -284,8 +276,6 @@ class TransferTools:
                             conn=acquired.conn,
                         )
                     else:
-                        local = resolve_local_target(self._settings, pair.local_path)
-                        sftp = await acquired.sftp_client()
                         result = await self._engine.download(
                             sftp,
                             pair.remote_path,

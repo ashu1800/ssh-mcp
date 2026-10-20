@@ -18,51 +18,32 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import asyncssh
 
 from ssh_mcp.config import Settings
+from ssh_mcp.errors import ToolFailure
 from ssh_mcp.models import CredentialPayload
 from ssh_mcp.ssh.auth_state import AuthState, AuthStateStore
 from ssh_mcp.ssh.keys import KeyStore, public_key_line
+from ssh_mcp.ssh.sftp_ops import replace_file
 from ssh_mcp.ssh.known_hosts import HostKeyStoreError, KnownHostsStore
 
 logger = logging.getLogger(__name__)
 
-COMPRESSED_EXTENSIONS = frozenset(
-    {
-        ".7z", ".apk", ".avi", ".bz2", ".deb", ".flac", ".gif", ".gz", ".iso", ".jar", ".jpeg",
-        ".jpg", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".ogg", ".png", ".rar", ".rpm", ".tar",
-        ".tgz", ".webm", ".webp", ".whl", ".xz", ".zip", ".zst",
-    }
-)
 
-
-class ConnectFailure(Exception):
-    """Structured connection failure, translated to a tool result by the caller."""
+class ConnectFailure(ToolFailure):
+    """Structured connection failure; already a tool error, so the pool re-raises it as-is."""
 
     def __init__(self, error: str, hint: str, *, stage: str, retryable: bool = False, **details) -> None:
-        super().__init__(hint)
-        self.error = error
-        self.hint = hint
-        self.stage = stage
-        self.retryable = retryable
-        self.details = details
-
-    def to_dict(self) -> dict:
-        payload = {"error": self.error, "stage": self.stage, "hint": self.hint, "retryable": self.retryable}
-        payload.update({k: v for k, v in self.details.items() if v is not None})
-        return payload
+        super().__init__(error, stage=stage, hint=hint, retryable=retryable, **details)
 
 
 @dataclass
 class ConnectResult:
     conn: asyncssh.SSHClientConnection
     auth_method: str
-    remote_path: Path | None = None
     warning: str | None = None
-    key_rejected: bool = False
     compression: str = "none"
 
 
@@ -83,11 +64,9 @@ class Connector:
 
     # -- public ---------------------------------------------------------------
 
-    async def connect(
-        self, payload: CredentialPayload, *, compression: str | None = None, timeout: float | None = None
-    ) -> ConnectResult:
+    async def connect(self, payload: CredentialPayload, *, timeout: float | None = None) -> ConnectResult:
         record = self._auth_state.get(*payload.key)
-        compression_choice = compression or self._compression_for(None)
+        compression_choice = self._compression()
         warning: str | None = None
         key_rejected = False
 
@@ -151,7 +130,6 @@ class Connector:
                 conn=conn,
                 auth_method=auth_method,
                 warning=warning or install_note,
-                key_rejected=key_rejected,
                 compression=compression_choice,
             )
 
@@ -176,23 +154,16 @@ class Connector:
             conn=conn,
             auth_method="password",
             warning=warning,
-            key_rejected=verify_error == "auth_failed_publickey",
             compression=compression_choice,
         )
 
     # -- internals ------------------------------------------------------------
 
-    def _compression_for(self, path: str | Path | None) -> str:
-        mode = self._settings.compression_mode
-        if mode != "auto":
-            return "zlib" if mode == "on" else "none"
-        if path is None:
-            return "zlib"
-        suffix = Path(path).suffix.lower()
-        return "none" if suffix in COMPRESSED_EXTENSIONS else "zlib"
-
-    def compression_for_path(self, path: str | Path | None) -> str:
-        return self._compression_for(path)
+    def _compression(self) -> str:
+        """Compression is negotiated per connection, and the connection is
+        established before any file is known, so this is purely the setting.
+        ``auto`` therefore means ``on`` (zlib), matching the README."""
+        return "none" if self._settings.compression_mode == "off" else "zlib"
 
     def _base_kwargs(self, payload: CredentialPayload, compression: str, timeout: float | None = None) -> dict:
         try:
@@ -382,17 +353,7 @@ class Connector:
             async with sftp.open(tmp_path, "wb") as handle:
                 await handle.write(updated.encode("utf-8"))
             await sftp.chmod(tmp_path, 0o600)
-            try:
-                await sftp.posix_rename(tmp_path, auth_path)
-            except asyncssh.SFTPOpUnsupported:
-                # Only a missing posix-rename extension can be replaced by the
-                # non-atomic sequence; other errors must not delete the user's
-                # authorized_keys before the rename has a chance to succeed.
-                try:
-                    await sftp.remove(auth_path)
-                except asyncssh.SFTPNoSuchFile:
-                    pass
-                await sftp.rename(tmp_path, auth_path)
+            await replace_file(sftp, tmp_path, auth_path)
             await sftp.chmod(auth_path, 0o600)
             logger.info("installed local public key into %s", auth_path)
             return "已将新公钥写入远端 authorized_keys"

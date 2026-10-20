@@ -19,6 +19,8 @@ from pathlib import Path
 
 import asyncssh
 
+from ssh_mcp.ssh.keys import public_key_line
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,19 +35,37 @@ class KnownHostsStore:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = asyncio.Lock()
+        self._cached: asyncssh.SSHKnownHosts | None = None
+        self._cached_stamp: tuple[int, int] | None = None
 
     @property
     def path(self) -> Path:
         return self._path
 
     def load(self) -> asyncssh.SSHKnownHosts:
+        """Return the parsed pin store, re-parsed only when the file changed.
+
+        ``pinned_store`` and ``trust``/``lookup`` each call this on every
+        connect (and the password-provisioning path opens a second connection),
+        so without the cache one connect parsed the whole file up to four times
+        on the event loop. ``trust`` invalidates the cache after appending.
+        """
         if not self._path.is_file():
             return asyncssh.SSHKnownHosts()
         try:
-            return asyncssh.read_known_hosts(str(self._path))
+            stat = self._path.stat()
+        except OSError as exc:
+            raise HostKeyStoreError(f"known_hosts 文件无法读取（{self._path}）：{exc}") from exc
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        if self._cached is not None and self._cached_stamp == stamp:
+            return self._cached
+        try:
+            store = asyncssh.read_known_hosts(str(self._path))
         except (ValueError, OSError) as exc:
             # A corrupt pin file must not silently degrade to "trust everything".
             raise HostKeyStoreError(f"known_hosts 文件无法解析（{self._path}）：{exc}") from exc
+        self._cached, self._cached_stamp = store, stamp
+        return store
 
     def lookup(self, host: str, addr: str | None, port: int) -> list[asyncssh.SSHKey]:
         """Return pinned keys for ``host``/``port`` (empty when unknown)."""
@@ -90,8 +110,10 @@ class KnownHostsStore:
                 # a *changed* key of an already-pinned type never reaches here
                 # because matching would have failed the connection.
                 logger.info("adding an additional host key type for %s", pattern)
-            line = f"{pattern} {_public_key_text(key)}"
+            line = f"{pattern} {public_key_line(key)}"
             await asyncio.to_thread(self._append_line, line)
+            self._cached = None
+            self._cached_stamp = None
             logger.info("pinned host key for %s (%s)", pattern, key.get_fingerprint("sha256"))
 
     def _append_line(self, line: str) -> None:
@@ -116,10 +138,3 @@ class KnownHostsStore:
 
 class HostKeyStoreError(RuntimeError):
     """The pin file could not be read or written."""
-
-
-def _public_key_text(key: asyncssh.SSHKey) -> str:
-    exported = key.export_public_key("openssh")
-    if isinstance(exported, bytes):
-        exported = exported.decode("ascii")
-    return exported.strip()

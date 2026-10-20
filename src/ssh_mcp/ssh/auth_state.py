@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
@@ -93,6 +93,13 @@ class AuthStateStore:
         now = time.time()
         record = self._records.get(key, AuthRecord())
         previous = record.state
+        changed = previous != state or (auth_method is not None and record.last_auth_method != auth_method)
+        if mark_invalid and record.invalid_at is None:
+            changed = True
+        if not changed:
+            # Steady state: every connect calls this, and rewriting the whole
+            # JSON file for an unchanged record is pure I/O on the event loop.
+            return
         record.state = state
         record.updated_at = now
         if auth_method:
@@ -136,7 +143,3 @@ class AuthStateStore:
         except OSError:  # pragma: no cover
             pass
         os.replace(tmp, self._path)
-
-    def snapshot(self) -> dict[str, dict]:
-        self._ensure_loaded()
-        return {key: asdict(record) for key, record in self._records.items()}

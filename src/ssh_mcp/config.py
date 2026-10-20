@@ -61,20 +61,6 @@ class _Source:
             return raw
         return self.toml(toml_key, default)
 
-    def boolean(self, env_name: str, toml_key: str, default: bool) -> bool:
-        raw = self.env(env_name)
-        if raw is None:
-            value = self.pick(env_name, toml_key, default)
-            if isinstance(value, bool):
-                return value
-            raw = str(value)
-        lowered = raw.lower()
-        if lowered in _TRUE:
-            return True
-        if lowered in _FALSE:
-            return False
-        raise ConfigError(f"{env_name} must be a boolean, got {raw!r}")
-
     def integer(self, env_name: str, toml_key: str, default: int, *, minimum=None, maximum=None) -> int:
         raw = self.pick(env_name, toml_key, default)
         try:
@@ -140,6 +126,7 @@ class Settings:
     auth_state_path: Path | None = None
     keys_dir: Path | None = None
     allowed_local_roots: list[Path] = field(default_factory=list)
+    resolved_local_roots: list[Path] = field(default_factory=list)
 
     # --- ssh -----------------------------------------------------------------
     connect_timeout: float = 10.0
@@ -190,6 +177,9 @@ class Settings:
         if not self.allowed_local_roots:
             self.allowed_local_roots = [Path.home() / "ssh-mcp-files"]
         self.allowed_local_roots = [p.expanduser() for p in self.allowed_local_roots]
+        # Resolved lazily and once: each ``Path.resolve`` stats every component,
+        # and a 200-file batch would otherwise re-walk every root 200 times.
+        self.resolved_local_roots = [p.resolve(strict=False) for p in self.allowed_local_roots]
 
     @property
     def http_is_loopback(self) -> bool:
@@ -209,8 +199,7 @@ class Settings:
         # ``resolve()`` follows symlinks where they exist and normalises the
         # rest, which is what the containment check must see.
         resolved = candidate.resolve(strict=False)
-        for root in self.allowed_local_roots:
-            root_resolved = root.resolve(strict=False)
+        for root_resolved in self.resolved_local_roots:
             if resolved == root_resolved or resolved.is_relative_to(root_resolved):
                 return resolved
         allowed = ", ".join(str(r) for r in self.allowed_local_roots)

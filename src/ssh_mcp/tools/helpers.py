@@ -11,25 +11,41 @@ from ssh_mcp.errors import ToolFailure
 
 MAX_TEXT_BYTES = 512 * 1024
 
+_RESULT_TOO_LARGE = {
+    "error": "result_too_large",
+    "hint": "结果过大，请缩小范围（如减小 max_output_bytes 或分页读取）。",
+}
+
+
+def _result(payload: dict[str, Any], *, is_error: bool = False) -> CallToolResult:
+    """Serialize once; ``structured_content`` is the payload itself.
+
+    The SDK serializes ``structured_content`` for its own wire format, so
+    re-parsing our JSON text into a dict was a third full pass over up to
+    512 KiB per call.
+    """
+    body = json.dumps(payload, ensure_ascii=False, default=str)
+    return CallToolResult(
+        content=[TextContent(type="text", text=body)],
+        structured_content=payload,
+        is_error=is_error,
+    )
+
 
 def tool_ok(payload: dict[str, Any]) -> CallToolResult:
     """Return a successful structured result."""
     body = json.dumps(payload, ensure_ascii=False, default=str)
-    if len(body.encode("utf-8")) > MAX_TEXT_BYTES:
-        body = json.dumps(
-            {"error": "result_too_large", "hint": "结果过大，请缩小范围（如减小 max_output_bytes 或分页读取）。"},
-            ensure_ascii=False,
-        )
-        return CallToolResult(content=[TextContent(type="text", text=body)], structured_content=json.loads(body), is_error=True)
-    return CallToolResult(content=[TextContent(type="text", text=body)], structured_content=json.loads(body))
+    if len(body) > MAX_TEXT_BYTES or len(body.encode("utf-8")) > MAX_TEXT_BYTES:
+        # ``len(body)`` is a cheap lower bound on the UTF-8 size; the exact
+        # encode only runs when the text could actually be too large.
+        return _result(_RESULT_TOO_LARGE, is_error=True)
+    return CallToolResult(content=[TextContent(type="text", text=body)], structured_content=payload)
 
 
 def tool_err(failure: ToolFailure) -> CallToolResult:
     """Return a structured error result (``is_error=True``)."""
-    body = json.dumps(failure.to_dict(), ensure_ascii=False, default=str)
-    return CallToolResult(content=[TextContent(type="text", text=body)], structured_content=failure.to_dict(), is_error=True)
+    return _result(failure.to_dict(), is_error=True)
 
 
 def tool_err_dict(payload: dict[str, Any]) -> CallToolResult:
-    body = json.dumps(payload, ensure_ascii=False, default=str)
-    return CallToolResult(content=[TextContent(type="text", text=body)], structured_content=payload, is_error=True)
+    return _result(payload, is_error=True)
