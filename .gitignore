@@ -22,3 +22,6 @@ htmlcov/
 # Secrets
 .env
 .env.local
+
+# Test artefacts
+.pytest-large.log
