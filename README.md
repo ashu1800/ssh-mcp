@@ -24,8 +24,7 @@ python -m venv .venv
 
 ### 方式二：装成一个普通命令（换机器时推荐）
 
-在任意一台已装好 Python 的机器上执行（仓库为私有，需要本机已配置 GitHub 凭据，
-例如 `gh auth setup-git`）：
+在任意一台已装好 Python 的机器上执行：
 
 ```bash
 python -m pip install --user "git+https://github.com/ashu1800/ssh-mcp.git"
@@ -77,7 +76,7 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 
 ## 一键安装并接入客户端
 
-先取得代码（仓库为私有，需要已配置 GitHub 凭据，例如 `gh auth setup-git`）：
+先取得代码：
 
 ```bash
 git clone https://github.com/ashu1800/ssh-mcp.git && cd ssh-mcp
@@ -95,27 +94,33 @@ python scripts/install.py --mcp-key mcp_xxx
 - **Claude Desktop**：标准版 `%APPDATA%\Claude`，3p 版 `%LOCALAPPDATA%\Claude-3p`
 - **Cursor**：`~/.cursor/mcp.json`
 - **VS Code / 通义灵码**：`%APPDATA%\Code\User\mcp.json`（`servers` 键）
+- **Windsurf**：`~/.codeium/windsurf/mcp_config.json`
+- **Trae / Qoder**：`%APPDATA%\<App>\User\mcp.json`
+- **WorkBuddy**：`~/.workbuddy/mcp.json`
+- **DSH**：`~/.dsh/skill-mcp-manager/registry.json`（注册表格式，保留其余条目）
+
+客户端按「已安装才写」处理：配置文件、应用数据目录或可执行文件任一存在即视为已安装，否则跳过。
 
 `--dry-run` 只报告会改哪些文件；`--skip-install` 只写配置；`--clients claude,cursor` 限定目标；
 `--from-wheel dist/xxx.whl` 在离线机器上安装。改动前会留 `.bak`，检测不到客户端的配置不会被创建。
 
 ### 不 clone 仓库的安装方式
 
-私有仓库匿名拉不到原始文件，所以用 pip 直接装（需要本机有 GitHub 凭据，如 `gh auth setup-git`）：
+下载安装脚本并运行即可，脚本发现不在仓库目录时会自动从 GitHub 安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ashu1800/ssh-mcp/main/scripts/install.py -o ssh-mcp-install.py
+```
+
+```bash
+python ssh-mcp-install.py --mcp-key mcp_xxx
+```
+
+也可以只装包、不改客户端配置（之后用 `claude mcp add` 手动接）：
 
 ```bash
 pip install --user "git+https://github.com/ashu1800/ssh-mcp.git"
 ```
-
-装完后再把密钥写进客户端配置，两种办法任选：
-
-**用仓库里的脚本**（需要 checkout，见上一节）：
-
-```bash
-python scripts/install.py --mcp-key mcp_xxx --skip-install
-```
-
-**用 `claude mcp add`**（只接 Claude Code，不用 checkout）：
 
 ```bash
 claude mcp add -s user ssh -e MCP_KEY=mcp_xxx -e SSH_MCP_ALLOWED_LOCAL_ROOTS=~/ssh-mcp-files -- ssh-mcp --transport stdio

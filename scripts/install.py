@@ -34,6 +34,7 @@ from typing import Any
 
 SERVER_NAME = "ssh"
 DEFAULT_ROOTS = "~/ssh-mcp-files"
+PACKAGE_URL = "git+https://github.com/ashu1800/ssh-mcp.git"
 
 
 @dataclass
@@ -204,41 +205,127 @@ def _desktop_installed(config: Path) -> bool:
     return (install_dir / "claude-code").exists() or bool(list(install_dir.iterdir()))
 
 
-def discover_clients() -> list[ClientTarget]:
+@dataclass(frozen=True)
+class ClientSpec:
+    """One MCP client and where it keeps its server list.
+
+    ``format`` selects the writer: ``mcp-json`` (``mcpServers`` map),
+    ``vscode-json`` (``servers`` map with a ``type`` field), ``dsh-registry``
+    (``~/.dsh`` skill registry) or ``claude-json`` (fallback when the Claude
+    Code CLI is absent).
+    """
+
+    label: str
+    file: Path
+    format: str
+    # Extra paths that prove the app is installed when the config is absent.
+    markers: tuple[Path, ...] = ()
+    # Executable names that prove the app is installed.
+    binaries: tuple[str, ...] = ()
+    # Whether a missing config may be created (vs. only updated when present).
+    create: bool = True
+
+
+def _client_specs() -> list[ClientSpec]:
     home = _home()
+    local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData/Local")
     appdata = Path(os.environ.get("APPDATA") or home / "AppData/Roaming")
-    candidates: list[ClientTarget] = []
+    mac = sys.platform == "darwin"
+    app_support = home / "Library/Application Support"
 
-    claude_json = home / ".claude.json"
-    candidates.append(ClientTarget("Claude Code (~/.claude.json)", claude_json, "claude-json"))
+    specs: list[ClientSpec] = [
+        ClientSpec("Claude Code", home / ".claude.json", "claude-json", binaries=("claude",)),
+    ]
 
-    # Claude Desktop. Two layouts exist on Windows: the standard build keeps
-    # its config in %APPDATA%\Claude, while the 3p (third-party) deployment
-    # keeps it in %LOCALAPPDATA%\Claude-3p. Writing only the standard path
-    # leaves the app that is actually installed reading a file nobody wrote.
-    for label, desktop in desktop_config_paths().items():
-        target = ClientTarget(label, desktop, "mcp-json")
-        target.note = "" if _desktop_installed(desktop) else "client not installed"
-        candidates.append(target)
-
-    cursor = home / ".cursor/mcp.json"
-    cursor_target = ClientTarget("Cursor", cursor, "mcp-json")
-    if not cursor.is_file() and not _binary_or_dir("cursor", home / ".cursor"):
-        cursor_target.note = "client not installed"
-    candidates.append(cursor_target)
-
-    # VS Code user-level MCP config (also picked up by 通义灵码's MCP view).
+    # Claude Desktop: the standard build and the 3p deployment keep separate
+    # configs, and only the installed one is authoritative.
+    desktop = (
+        appdata / "Claude/claude_desktop_config.json"
+        if os.name == "nt"
+        else (app_support / "Claude/claude_desktop_config.json" if mac else home / ".config/Claude/claude_desktop_config.json")
+    )
+    specs.append(ClientSpec("Claude Desktop", desktop, "mcp-json"))
     if os.name == "nt":
-        vscode = appdata / "Code/User/mcp.json"
-    elif sys.platform == "darwin":
-        vscode = home / "Library/Application Support/Code/User/mcp.json"
-    else:
-        vscode = home / ".config/Code/User/mcp.json"
-    vscode_target = ClientTarget("VS Code / 通义灵码", vscode, "vscode-json")
-    if not vscode.is_file() and not _binary_or_dir("code", vscode.parent):
-        vscode_target.note = "client not installed"
-    candidates.append(vscode_target)
+        specs.append(ClientSpec("Claude Desktop (3p)", local / "Claude-3p/claude_desktop_config.json", "mcp-json"))
 
+    specs.append(
+        ClientSpec("Cursor", home / ".cursor/mcp.json", "mcp-json", markers=(home / ".cursor",), binaries=("cursor",))
+    )
+
+    vscode = (
+        appdata / "Code/User/mcp.json"
+        if os.name == "nt"
+        else (app_support / "Code/User/mcp.json" if mac else home / ".config/Code/User/mcp.json")
+    )
+    specs.append(ClientSpec("VS Code / 通义灵码", vscode, "vscode-json"))
+
+    # Windsurf keeps a single JSON config beside its data directory.
+    windsurf = home / ".codeium/windsurf/mcp_config.json"
+    specs.append(
+        ClientSpec(
+            "Windsurf",
+            windsurf,
+            "mcp-json",
+            markers=(home / ".codeium/windsurf", home / ".windsurf"),
+            binaries=("windsurf",),
+        )
+    )
+
+    # Trae: per-user MCP config next to the app data.
+    trae = (
+        appdata / "Trae/User/mcp.json"
+        if os.name == "nt"
+        else (app_support / "Trae/User/mcp.json" if mac else home / ".config/Trae/User/mcp.json")
+    )
+    specs.append(ClientSpec("Trae", trae, "mcp-json", markers=(trae.parent.parent,), binaries=("trae",)))
+
+    # Qoder: same VS Code-derived layout.
+    qoder = (
+        appdata / "Qoder/User/mcp.json"
+        if os.name == "nt"
+        else (app_support / "Qoder/User/mcp.json" if mac else home / ".config/Qoder/User/mcp.json")
+    )
+    specs.append(ClientSpec("Qoder", qoder, "mcp-json", markers=(qoder.parent.parent,), binaries=("qoder",)))
+
+    # WorkBuddy.
+    workbuddy = home / ".workbuddy/mcp.json"
+    specs.append(
+        ClientSpec(
+            "WorkBuddy",
+            workbuddy,
+            "mcp-json",
+            markers=(home / ".workbuddy",),
+            binaries=("workbuddy",),
+        )
+    )
+
+    # DSH: a registry of entries rather than an mcpServers map. Its own file
+    # also stores credentials, so it is only ever updated, never created here.
+    specs.append(
+        ClientSpec(
+            "DSH",
+            home / ".dsh/skill-mcp-manager/registry.json",
+            "dsh-registry",
+            markers=(home / ".dsh",),
+            binaries=("dsh",),
+        )
+    )
+
+    return specs
+
+
+def discover_clients() -> list[ClientTarget]:
+    candidates: list[ClientTarget] = []
+    for spec in _client_specs():
+        installed = (
+            spec.file.is_file()
+            or any(marker.is_dir() and any(marker.iterdir()) for marker in spec.markers)
+            or any(shutil.which(binary) for binary in spec.binaries)
+        )
+        target = ClientTarget(spec.label, spec.file, spec.format)
+        if not installed:
+            target.note = "client not installed"
+        candidates.append(target)
     for candidate in candidates:
         candidate.exists = candidate.path.is_file()
     return candidates
@@ -301,24 +388,63 @@ def _write_json(path: Path, data: dict[str, Any], *, dry_run: bool) -> bool:
 
 
 def wire_file(target: ClientTarget, entry: dict[str, Any], *, dry_run: bool) -> None:
+    if target.kind == "dsh-registry":
+        target.changed = _wire_dsh(target.path, entry, dry_run=dry_run)
+        return
+
     data = _load_json(target.path)
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-        data["mcpServers"] = servers
-    servers[SERVER_NAME] = entry
     if target.kind == "vscode-json":
-        # VS Code's schema keys servers under "servers" rather than "mcpServers".
-        data.setdefault("servers", {}).setdefault(SERVER_NAME, {"type": "stdio", **entry})
-        data["mcpServers"].pop(SERVER_NAME, None)
-        if not data["mcpServers"]:
-            data.pop("mcpServers")
+        # VS Code's schema keys servers under "servers" and requires a type.
+        servers = data.setdefault("servers", {})
+        servers[SERVER_NAME] = {"type": "stdio", **entry}
+    else:
+        servers = data.setdefault("mcpServers", {})
+        servers[SERVER_NAME] = entry
     target.changed = _write_json(target.path, data, dry_run=dry_run)
+
+
+def _wire_dsh(path: Path, entry: dict[str, Any], *, dry_run: bool) -> bool:
+    """Write into DSH's skill registry (``entries`` list, not a name map).
+
+    The registry also holds credentials and tool snapshots for other servers,
+    so every existing entry is preserved byte-for-byte; only the ssh entry is
+    replaced or appended.
+    """
+    data = _load_json(path)
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    data["entries"] = entries
+    data.setdefault("version", 1)
+    record = {
+        "id": SERVER_NAME,
+        "name": SERVER_NAME,
+        "tier": "on-demand",
+        "transport": "stdio",
+        "command": entry["command"],
+        "args": list(entry["args"]),
+        "env": dict(entry["env"]),
+        "cwd": None,
+        "url": None,
+        "headers": {},
+        "notes": "installed by ssh-mcp installer",
+        "managed": True,
+    }
+    for index, existing in enumerate(entries):
+        if isinstance(existing, dict) and existing.get("id") == SERVER_NAME:
+            # Keep the client's own bookkeeping fields (timestamps, tool cache).
+            merged = {**existing, **record}
+            merged.pop("tools", None)
+            entries[index] = merged
+            break
+    else:
+        entries.append(record)
+    return _write_json(path, data, dry_run=dry_run)
 
 
 def _matches(label: str, wanted: set[str]) -> bool:
     lowered = label.lower()
-    return any(word in lowered for word in wanted if word not in {"claude", "all"})
+    return any(word in lowered for word in wanted if word not in {"all"})
 
 
 def wire_claude_code(
@@ -415,10 +541,9 @@ def main(argv: list[str] | None = None) -> int:
         # into a venv there would be pointless, so use the running interpreter.
         args.venv = str(repo / ".venv") if checkout else ""
     if not checkout and not (args.package or args.from_wheel or args.skip_install):
-        raise SystemExit(
-            "this script is not running from a project checkout; "
-            "pass --package git+https://github.com/ashu1800/ssh-mcp.git (or --from-wheel)"
-        )
+        # Public repo: a downloaded copy of this script can install straight
+        # from GitHub without the user having to know the URL flag.
+        args.package = PACKAGE_URL
     wanted = {part.strip().lower() for part in args.clients.split(",") if part.strip()}
 
     result = InstallResult()
