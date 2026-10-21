@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import Any
 
 SERVER_NAME = "ssh"
-DEFAULT_ROOTS = "~/ssh-mcp-files"
 PACKAGE_URL = "git+https://github.com/ashu1800/ssh-mcp.git"
 
 
@@ -481,10 +480,12 @@ def launch_argv(command: str) -> list[str]:
 
 
 def build_entry(command: str, args: argparse.Namespace) -> dict[str, Any]:
-    env = {
-        "MCP_KEY": args.mcp_key,
-        "SSH_MCP_ALLOWED_LOCAL_ROOTS": args.allowed_roots,
-    }
+    env = {"MCP_KEY": args.mcp_key}
+    if args.allowed_roots:
+        # Unset means unrestricted, so only write the variable when the user
+        # asked for a sandbox; an empty value would mean the same thing but
+        # reads as if something had gone wrong.
+        env["SSH_MCP_ALLOWED_LOCAL_ROOTS"] = args.allowed_roots
     if args.state_dir:
         env["SSH_MCP_STATE_DIR"] = args.state_dir
     argv = launch_argv(command)
@@ -799,7 +800,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="pip requirement to install instead of the local checkout (e.g. git+https://github.com/ashu1800/ssh-mcp.git)",
     )
     parser.add_argument("--from-wheel", help="install this wheel instead of the local source tree")
-    parser.add_argument("--allowed-roots", default=DEFAULT_ROOTS, help="directories the AI may read/write locally")
+    parser.add_argument(
+        "--allowed-roots",
+        default=None,
+        help=(
+            "restrict local file transfers to these directories (separated by os.pathsep); "
+            "omit to leave local paths unrestricted"
+        ),
+    )
     parser.add_argument("--state-dir", help="override SSH_MCP_STATE_DIR")
     parser.add_argument("--scope", default="user", choices=("local", "user", "project"), help="Claude Code scope")
     parser.add_argument(

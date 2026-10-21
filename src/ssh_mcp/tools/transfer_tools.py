@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class FilePair(BaseModel):
-    local_path: str = Field(description="本地文件路径（MCP 所在机器），必须位于允许的本地根目录内。")
+    local_path: str = Field(description="本地文件路径（MCP 所在机器）。若服务端配置了允许根目录，则必须位于其内。")
     remote_path: str = Field(description="远端文件路径（POSIX 风格绝对路径）。")
 
 
@@ -41,7 +41,7 @@ class TransferTools:
             connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             local_path: Annotated[
                 str,
-                Field(description="本地文件路径（MCP 所在机器），必须位于 SSH_MCP_ALLOWED_LOCAL_ROOTS 指定的根目录内。"),
+                Field(description="本地文件路径（MCP 所在机器）。若设置了 SSH_MCP_ALLOWED_LOCAL_ROOTS，则必须位于其根目录内。"),
             ],
             remote_path: Annotated[str, Field(description="远端目标文件路径，如 /home/app/release.tar.gz。")],
             overwrite: Annotated[bool, Field(description="目标已存在时是否覆盖。默认 false，会在传输前直接拒绝。")] = False,
@@ -97,7 +97,7 @@ class TransferTools:
             remote_path: Annotated[str, Field(description="远端文件路径，如 /var/log/app.log。")],
             local_path: Annotated[
                 str,
-                Field(description="本地目标路径（MCP 所在机器），必须位于 SSH_MCP_ALLOWED_LOCAL_ROOTS 指定的根目录内。"),
+                Field(description="本地目标路径（MCP 所在机器）。若设置了 SSH_MCP_ALLOWED_LOCAL_ROOTS，则必须位于其根目录内。"),
             ],
             overwrite: Annotated[bool, Field(description="本地文件已存在时是否覆盖。默认 false，会在传输前直接拒绝。")] = False,
             confirm: Annotated[

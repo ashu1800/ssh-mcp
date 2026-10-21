@@ -64,7 +64,7 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MCP_KEY` | 必填 | 调接口与派生解密密钥 |
-| `SSH_MCP_ALLOWED_LOCAL_ROOTS` | `~/ssh-mcp-files` | 允许读写的本机目录（realpath 校验，symlink 解析后判断） |
+| `SSH_MCP_ALLOWED_LOCAL_ROOTS` | 空（不限制） | 可选。设置后本地传输只允许这些目录（`os.pathsep` 分隔，realpath 校验，symlink 解析后判断）；不设置则不限路径 |
 | `SSH_MCP_STATE_DIR` | `~/.ssh-mcp` | known_hosts、Ed25519 私钥、认证状态 |
 | `SSH_MCP_SFTP_BLOCK_SIZE` | 256 KiB | SFTP 请求流水线块大小 |
 | `SSH_MCP_SFTP_IDLE_TIMEOUT` | 60 s | 连续无数据即中止（大文件主超时） |
@@ -149,7 +149,7 @@ pip install --user "git+https://github.com/ashu1800/ssh-mcp.git"
 ```
 
 ```bash
-claude mcp add -s user ssh -e MCP_KEY=mcp_xxx -e SSH_MCP_ALLOWED_LOCAL_ROOTS=~/ssh-mcp-files -- ssh-mcp --transport stdio
+claude mcp add -s user ssh -e MCP_KEY=mcp_xxx -- ssh-mcp --transport stdio
 ```
 
 ## 更新已安装的机器
@@ -193,8 +193,7 @@ stdio（推荐本地使用）：
       "command": "D:/Sync/AICoding/ssh-mcp/.venv/Scripts/python.exe",
       "args": ["-m", "ssh_mcp", "--transport", "stdio"],
       "env": {
-        "MCP_KEY": "mcp_xxx",
-        "SSH_MCP_ALLOWED_LOCAL_ROOTS": "D:/Sync/ssh-files"
+        "MCP_KEY": "mcp_xxx"
       }
     }
   }
@@ -294,7 +293,8 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 ## 安全
 
 - 密码/私钥只在内存；日志过滤器会脱敏 `mcp_` 令牌、PEM 私钥与 `password` 字段。
-- 本地路径经 `realpath` 后必须落在允许根目录内，symlink 逃逸同样拒绝。
+- 本地传输默认**不限制路径**（AI 可以直接上传构建产物）；设置 `SSH_MCP_ALLOWED_LOCAL_ROOTS` 后经 `realpath`
+  校验必须落在其内，symlink 逃逸同样拒绝。见「已知取舍」第 4 条。
 - `known_hosts` 位于 `~/.ssh-mcp/known_hosts`；首次信任后指纹变化会拒绝连接。
 - HTTP 默认绑定 `127.0.0.1`，校验 `Origin`，可要求 Bearer；绑定非回环地址而未设置 Token 时拒绝启动。
 - 私钥文件 600、目录 700（Windows 上权限位语义有限，依赖文件系统 ACL）。
@@ -311,3 +311,7 @@ SSH_MCP_RUN_LARGE=1 pytest -m large -q           # 1 GB 内存基线
 1. SSH 压缩在连接级协商，因此只能按连接配置：`auto` 与 `on` 等价（协商 zlib），`off` 关闭压缩。连接在 `connect` 时建立，此时还没有目标文件，池 key `(host, port, username)` 也不含压缩维度，所以不做按文件扩展名的判断；需要为大批已压缩文件关压缩时，把 `SSH_MCP_COMPRESSION=off` 并重新 `connect`。
 2. HTTP 无状态模式下，客户端断开会触发请求取消；`json_response=False`（默认 SSE）是保证进度与取消可用的前提。
 3. Windows 上无法设置 POSIX 权限位，`chmod` 作用于远端不受影响，本地密钥文件权限依赖 ACL。
+4. 本地路径默认不限制，是因为 AI 常需要上传源码树里的构建产物，强制单一目录会让每次上传都先失败一次。
+   代价是这个 MCP 进程能读到你账号可达的任何本地文件，包括 `~/.ssh` 下的私钥。如果要收紧，设置
+   `SSH_MCP_ALLOWED_LOCAL_ROOTS`（多个根用系统路径分隔符隔开），或用安装脚本的 `--allowed-roots`。
+   注意这是**进程级权限**，不是按会话隔离：同一实例的所有客户端共用同一份限制。

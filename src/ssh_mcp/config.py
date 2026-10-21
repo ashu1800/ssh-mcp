@@ -127,7 +127,6 @@ class Settings:
     keys_dir: Path | None = None
     allowed_local_roots: list[Path] = field(default_factory=list)
     resolved_local_roots: list[Path] = field(default_factory=list)
-
     # --- ssh -----------------------------------------------------------------
     connect_timeout: float = 10.0
     login_timeout: float = 20.0
@@ -174,8 +173,10 @@ class Settings:
         self.known_hosts_path = self.known_hosts_path.expanduser()
         self.auth_state_path = self.auth_state_path.expanduser()
         self.keys_dir = self.keys_dir.expanduser()
-        if not self.allowed_local_roots:
-            self.allowed_local_roots = [Path.home() / "ssh-mcp-files"]
+        # An empty allowlist means "not restricted": local transfers may touch
+        # any path the user running the server can reach. Roots are only
+        # enforced when at least one is configured, so the restriction is
+        # opt-in rather than silently truncating the AI to one directory.
         self.allowed_local_roots = [p.expanduser() for p in self.allowed_local_roots]
         # Resolved lazily and once: each ``Path.resolve`` stats every component,
         # and a 200-file batch would otherwise re-walk every root 200 times.
@@ -185,11 +186,18 @@ class Settings:
     def http_is_loopback(self) -> bool:
         return self.http_host.lower() in {"127.0.0.1", "localhost", "::1"}
 
+    @property
+    def local_paths_restricted(self) -> bool:
+        """Whether local transfers are confined to :attr:`allowed_local_roots`."""
+        return bool(self.resolved_local_roots)
+
     def resolve_local_path(self, raw: str) -> Path:
         """Return the realpath for ``raw``, rejecting anything outside the allowlist.
 
         Symlinks are resolved before the containment check, so a link inside an
-        allowed root that points outside it is rejected.
+        allowed root that points outside it is rejected. With no roots
+        configured the path is returned unrestricted -- see
+        :attr:`local_paths_restricted`.
         """
         if "\x00" in raw:
             raise PathNotAllowed(raw, "路径包含 NUL 字符")
@@ -199,6 +207,8 @@ class Settings:
         # ``resolve()`` follows symlinks where they exist and normalises the
         # rest, which is what the containment check must see.
         resolved = candidate.resolve(strict=False)
+        if not self.resolved_local_roots:
+            return resolved
         for root_resolved in self.resolved_local_roots:
             if resolved == root_resolved or resolved.is_relative_to(root_resolved):
                 return resolved
@@ -229,7 +239,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     state_dir = Path(str(state_dir_raw)).expanduser() if state_dir_raw else Path.home() / ".ssh-mcp"
 
     roots_raw = src.env("SSH_MCP_ALLOWED_LOCAL_ROOTS")
-    if roots_raw:
+    if roots_raw is not None:
+        # Explicitly set -- including an empty value, which means "no limit".
         allowed_roots = _split_paths(roots_raw)
     else:
         toml_roots = src.toml("allowed_local_roots")
@@ -238,7 +249,10 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         elif isinstance(toml_roots, str):
             allowed_roots = _split_paths(toml_roots)
         else:
-            allowed_roots = [Path.home() / "ssh-mcp-files"]
+            # Unset: local transfers are unrestricted. Confining the AI to one
+            # directory is opt-in, because the useful default is "let it read
+            # the build output it was asked to upload".
+            allowed_roots = []
 
     total_raw = src.env("SSH_MCP_SFTP_TOTAL_TIMEOUT")
     if total_raw is None:
