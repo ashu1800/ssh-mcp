@@ -39,13 +39,28 @@ class ExecTools:
             ] = None,
             allow_interactive: Annotated[
                 bool,
-                Field(description="为 true 时允许执行 top/vim 等交互式命令（通常不可用，建议改用非交互形式）。"),
+                Field(
+                    description=(
+                        "仅在确实需要 TTY 时才设为 true（会一直挂到超时，通常没用）。"
+                        "绝大多数情况请改用上面括号里的批处理写法，不要打开这个开关。"
+                    )
+                ),
             ] = False,
         ) -> CallToolResult:
             """在已连接的服务器上执行一条非交互式命令，返回 stdout、stderr、退出码与截断标记。
             返回 {stdout, stderr, exit_code, exit_signal, truncated, stdout_total_bytes, duration_seconds}；
             超时返回 timed_out=true 与已收集的输出，并保证远端进程已被终止。
-            Use when 需要查看系统状态、运行脚本、查询服务日志等一次性命令；交互式程序请使用批处理参数（如 top -b -n1）。
+            Use when 需要查看系统状态、运行脚本、查询服务日志等一次性命令。
+
+            这个通道没有终端，任何等待键盘输入的程序都会挂起到超时，所以下面几类必须写成批处理形式：
+            - 持续刷新的：`top` → `top -b -n1`；`watch` → 用 `while sleep` 循环或直接查一次
+            - 分页的：`less`/`more`/`man` → `cat`、`--no-pager`、`head -n 100`
+            - 跟随文件的：`tail -f`/`journalctl -f` → `tail -n 100`、`journalctl --no-pager -n 100`
+            - 交互式编辑器：`vi`/`vim`/`nano` → 用 `sed -i` 或重定向写文件
+            - 数据库/shell 客户端：把语句交给参数，`mysql -e 'select 1'`、`psql -c 'select 1'`、
+              `redis-cli ping`；不要只写 `mysql`、`psql`、`redis-cli`、`python3`、`bash` 之类的光杆命令
+
+            引号内的内容不会被当成命令：`grep -E 'mysql|redis'` 是安全的搜索，不会被误判。
             """
             try:
                 result = await self._runner.run(

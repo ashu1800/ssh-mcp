@@ -6,7 +6,7 @@ import asyncio
 import pytest
 
 from ssh_mcp.errors import ToolFailure
-from ssh_mcp.ssh.commands import CommandRunner
+from ssh_mcp.ssh.commands import CommandRunner, _interactive_reason
 
 pytestmark = pytest.mark.asyncio
 
@@ -59,6 +59,63 @@ async def test_interactive_commands_are_refused(runner, handle, command):
 async def test_interactive_can_be_forced(runner, handle):
     result = await runner.run(handle, "echo allowed", allow_interactive=True)
     assert result.stdout.strip() == "allowed"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A REPL name inside a quoted pattern is a search, not a command. This
+        # was rejected as "interactive `mysql`" because the pipeline was split
+        # on every ``|`` regardless of quoting.
+        "grep -E 'basic|mysql|redis|nginx' /etc/hosts",
+        "grep -E 'a|b' /etc/hosts",
+        'echo "a; b" | grep x',
+        "echo 'vim'",
+        # The paired forms must keep working, so the fix is not a blanket allow.
+        "mysql -uroot -e 'select 1'",
+        "psql -c 'select 1'",
+        "top -b -n1",
+        "tail -n 100 /etc/hosts",
+        "python3 script.py",
+        "bash -c 'echo hi'",
+        "ssh host uptime",
+        # Piped stdin is a command source for these REPLs.
+        "cat script.sql | psql",
+        "echo 'select 1' | redis-cli",
+        "cat script.sh | bash",
+    ],
+)
+async def test_non_interactive_forms_are_allowed(command):
+    # Pure validation, but the module-wide asyncio mark applies to every test.
+    assert _interactive_reason(command) is None
+
+
+@pytest.mark.parametrize(
+    "command, offender",
+    [
+        ("mysql", "mysql"),
+        ("echo hi; mysql", "mysql"),
+        ("echo hi | mysql", "mysql"),
+        # ``mysql`` does not read commands from the pipe, so it still prompts.
+        ("echo 'select 1' | mysql", "mysql"),
+        ("python3", "python3"),
+        ("bash", "bash"),
+        ("ssh host", "ssh"),
+        ("tail -f /var/log/syslog", "tail -f"),
+    ],
+)
+async def test_bare_repls_are_still_refused(command, offender):
+    assert _interactive_reason(command) == offender
+
+
+@pytest.mark.asyncio
+async def test_rejection_message_names_the_offending_command(runner, handle):
+    with pytest.raises(ToolFailure) as excinfo:
+        await runner.run(handle, "echo hi | mysql")
+    assert excinfo.value.error == "interactive_command_rejected"
+    assert excinfo.value.details["command"] == "mysql"
+    # The hint has to carry the way out, not just the refusal.
+    assert "mysql -e" in excinfo.value.hint
 
 
 @pytest.mark.asyncio

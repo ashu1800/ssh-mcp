@@ -70,43 +70,88 @@ class CommandResult:
         return payload
 
 
+def _split_shell(command: str) -> list[tuple[list[str], bool, str]]:
+    """Split a shell command line into the commands it actually runs.
+
+    Quoting has to be honoured: ``grep -E 'a|mysql'`` searches for that
+    pattern, it does not pipe into ``mysql``. ``shlex`` in POSIX mode keeps
+    quoted text together, and ``punctuation_chars`` exposes the unquoted
+    operators so they can act as separators.
+
+    Returns ``(tokens, fed_by_pipe)`` per command, in order.
+    ``fed_by_pipe`` is true when the previous command's stdout is this
+    command's stdin, which a couple of REPLs treat as a script to run instead
+    of opening a prompt. Redirections are dropped.
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quotes: fall back to plain whitespace splitting rather
+        # than guessing; a false negative here is safer than a false positive.
+        return [(command.split(), False)]
+
+    commands: list[tuple[list[str], bool]] = []
+    current: list[str] = []
+    fed_by_pipe = False
+    skip_next = False
+    for token in tokens:
+        if skip_next:
+            # The target of a redirection, e.g. the path in ``2>/dev/null``.
+            skip_next = False
+            continue
+        if token and set(token) <= set(";&|()"):
+            if current:
+                commands.append((current, fed_by_pipe))
+            current = []
+            # ``||`` and ``;;`` still separate commands; only ``|`` feeds stdin.
+            fed_by_pipe = token == "|"
+            continue
+        if token and set(token) <= set("<>"):
+            skip_next = True
+            continue
+        if token.startswith(">") or token.startswith("<") or token.endswith(">"):
+            # ``2>`` / ``>/dev/null`` / ``2>&1`` arrive glued to the fd or path.
+            continue
+        current.append(token)
+    if current:
+        commands.append((current, fed_by_pipe))
+    return commands
+
+
 def _interactive_reason(command: str) -> str | None:
     """Return the offending program when ``command`` obviously needs a TTY."""
     stripped = command.strip()
     if not stripped:
         return None
-    for segment in stripped.split(";"):
-        for pipeline_part in segment.split("|"):
-            part = pipeline_part.strip()
-            if not part:
-                continue
-            try:
-                tokens = shlex.split(part)
-            except ValueError:
-                tokens = part.split()
-            tokens = _strip_wrappers(tokens)
-            if not tokens:
-                continue
-            program = tokens[0].rsplit("/", 1)[-1]
-            rest = tokens[1:]
-            if program in _ALWAYS_INTERACTIVE:
-                return program
-            if program == "top" and not any(token in {"-b", "-H", "-n"} for token in rest):
-                # ``top -b -n1`` is the documented batch alternative.
-                return program
-            if program in {"tail", "journalctl"} and _FOLLOW_FLAGS.intersection(rest):
-                return f"{program} {' '.join(sorted(_FOLLOW_FLAGS.intersection(rest)))}"
-            if program in _REPL_WITHOUT_ARGS and not _has_program_argument(program, rest):
-                return program
+    for tokens, fed_by_pipe in _split_shell(stripped):
+        tokens = _strip_wrappers(tokens)
+        if not tokens:
+            continue
+        program = tokens[0].rsplit("/", 1)[-1]
+        rest = tokens[1:]
+        if program in _ALWAYS_INTERACTIVE:
+            return program
+        if program == "top" and not any(token in {"-b", "-H", "-n"} for token in rest):
+            # ``top -b -n1`` is the documented batch alternative.
+            return program
+        if program in {"tail", "journalctl"} and _FOLLOW_FLAGS.intersection(rest):
+            return f"{program} {' '.join(sorted(_FOLLOW_FLAGS.intersection(rest)))}"
+        if program in _REPL_WITHOUT_ARGS and not _reads_stdin(program, rest, fed_by_pipe):
+            return program
     return None
 
 
-def _has_program_argument(program: str, rest: list[str]) -> bool:
+def _reads_stdin(program: str, rest: list[str], fed_by_pipe: bool) -> bool:
     """Whether ``rest`` gives the REPL something to run instead of a prompt.
 
     Every one of these programs falls back to reading commands from stdin when
     it gets nothing to execute, and the exec channel's stdin stays open -- so
-    "no argument" means "hangs until the timeout".
+    "no argument" means "hangs until the timeout". Being on the right side of a
+    pipe counts as "has input" only for the programs that actually parse their
+    stdin as commands; for the rest the pipe just feeds data and they still
+    open a prompt.
     """
     # An input redirect hands the program a file instead of our open channel.
     if "<" in rest:
@@ -116,20 +161,23 @@ def _has_program_argument(program: str, rest: list[str]) -> bool:
     if program in {"python", "python3", "node", "irb"}:
         return bool(positional) or bool(flags & {"-c", "-m", "-e", "-p", "--eval", "--print"})
     if program in {"bash", "sh", "zsh", "fish", "tcsh", "csh"}:
-        return bool(positional) or bool(flags & {"-c", "-i"})
+        return bool(positional) or bool(flags & {"-c", "-i"}) or fed_by_pipe
     if program in {"pwsh", "powershell"}:
         return bool(flags & {"-Command", "-File", "-c", "-EncodedCommand"})
     if program in {"mysql", "psql", "redis-cli"}:
         # The database name / query is positional only for redis-cli; for
-        # mysql/psql the query comes through a flag.
-        return bool(flags & {"-e", "-c", "-f", "--execute", "--command", "--file"}) or (
-            program == "redis-cli" and bool(positional)
-        )
+        # mysql/psql the query comes through a flag. Piped stdin is only a
+        # command source for psql and redis-cli.
+        if program == "redis-cli" and (positional or fed_by_pipe):
+            return True
+        if program == "psql" and fed_by_pipe:
+            return True
+        return bool(flags & {"-e", "-c", "-f", "--execute", "--command", "--file"})
     if program in {"ssh", "telnet"}:
         # ``ssh host`` alone opens a shell; ``ssh host uptime`` runs and exits.
         return len(positional) >= 2
     # ftp/sftp read commands from stdin unless given a batch file.
-    return bool(flags & {"-b", "--batch-file"})
+    return bool(flags & {"-b", "--batch-file"}) or fed_by_pipe
 
 
 # Wrappers that run another program; the program after them is the real subject.
@@ -186,8 +234,11 @@ class CommandRunner:
                     "interactive_command_rejected",
                     stage="validate",
                     hint=(
-                        f"检测到交互式命令 `{offender}`，非交互式通道执行会挂起。"
-                        "请改用非交互形式（如 `top -b -n1`、`tail -n 100`），或显式传 allow_interactive=true。"
+                        f"命令里的 `{offender}` 会等待终端输入，在非交互通道上会一直挂起到超时。"
+                        "改法：加批处理参数（`top -b -n1`、`tail -n 100`、`journalctl --no-pager -n 100`），"
+                        "把查询交给参数（`mysql -e 'select 1'`、`psql -c 'select 1'`），"
+                        "或从 stdin 喂输入（`echo 'select 1' | redis-cli`）。"
+                        "只有在确实需要 TTY 时才传 allow_interactive=true。"
                     ),
                     retryable=False,
                     command=offender,
