@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,7 +44,7 @@ class ClientTarget:
 
     label: str
     path: Path
-    kind: str  # "claude-json" | "mcp-json" | "vscode-json"
+    kind: str  # "claude-json" | "mcp-json" | "vscode-json" | "cli" | "dsh-profile"
     exists: bool = False
     changed: bool = False
     note: str = ""
@@ -210,9 +211,9 @@ class ClientSpec:
     """One MCP client and where it keeps its server list.
 
     ``format`` selects the writer: ``mcp-json`` (``mcpServers`` map),
-    ``vscode-json`` (``servers`` map with a ``type`` field), ``dsh-registry``
-    (``~/.dsh`` skill registry) or ``claude-json`` (fallback when the Claude
-    Code CLI is absent).
+    ``vscode-json`` (``servers`` map with a ``type`` field), ``dsh-profile``
+    (the managed block in a DSH profile's ``cordis.patch.yml``) or
+    ``claude-json`` (fallback when the Claude Code CLI is absent).
     """
 
     label: str
@@ -299,17 +300,23 @@ def _client_specs() -> list[ClientSpec]:
         )
     )
 
-    # DSH: a registry of entries rather than an mcpServers map. Its own file
-    # also stores credentials, so it is only ever updated, never created here.
-    specs.append(
-        ClientSpec(
-            "DSH",
-            home / ".dsh/skill-mcp-manager/registry.json",
-            "dsh-registry",
-            markers=(home / ".dsh",),
-            binaries=("dsh",),
+    # DSH ships as two editions with independent profile roots -- the desktop
+    # app and the web server -- and each reads its MCP servers from
+    # ``profiles/<name>/cordis.patch.yml``. ``~/.dsh/skill-mcp-manager/
+    # registry.json`` is a cache the panel derives from those rows, so writing
+    # it alone changes nothing the loader reads.
+    for edition in ("desktop", "web"):
+        profile = home / f".dsh/profiles/{edition}"
+        specs.append(
+            ClientSpec(
+                f"DSH ({edition})",
+                profile / "cordis.patch.yml",
+                "dsh-profile",
+                # A profile root without package.json is not a profile DSH knows.
+                markers=(profile,) if (profile / "package.json").is_file() else (),
+                binaries=("dsh",),
+            )
         )
-    )
 
     return specs
 
@@ -388,8 +395,8 @@ def _write_json(path: Path, data: dict[str, Any], *, dry_run: bool) -> bool:
 
 
 def wire_file(target: ClientTarget, entry: dict[str, Any], *, dry_run: bool) -> None:
-    if target.kind == "dsh-registry":
-        target.changed = _wire_dsh(target.path, entry, dry_run=dry_run)
+    if target.kind == "dsh-profile":
+        target.changed = _wire_dsh_profile(target.path, entry, dry_run=dry_run)
         return
 
     data = _load_json(target.path)
@@ -403,43 +410,198 @@ def wire_file(target: ClientTarget, entry: dict[str, Any], *, dry_run: bool) -> 
     target.changed = _write_json(target.path, data, dry_run=dry_run)
 
 
-def _wire_dsh(path: Path, entry: dict[str, Any], *, dry_run: bool) -> bool:
-    """Write into DSH's skill registry (``entries`` list, not a name map).
+def _wire_dsh_profile(path: Path, entry: dict[str, Any], *, dry_run: bool) -> bool:
+    """Write the ssh server into a DSH profile's ``cordis.patch.yml``.
 
-    The registry also holds credentials and tool snapshots for other servers,
-    so every existing entry is preserved byte-for-byte; only the ssh entry is
-    replaced or appended.
+    The file is a top-level YAML array of loader patch entries. The MCP panel
+    owns one block between ``# >>> dsh-skill-mcp-panel:mcp:begin`` and
+    ``# <<< ...:end`` and rewrites everything inside it on the next save, so
+    that block is the only place a row can live and survive a panel edit.
+    Outside those two comment lines nothing is touched: the same file also
+    holds model providers and other plugins' settings.
+
+    No YAML library is available to this script (it has to run from a bare
+    Python), so the row is emitted as text and every other line is copied
+    through unchanged. The shape mirrors what the panel itself writes, so its
+    "MCP" page lists the server and can edit it afterwards.
     """
-    data = _load_json(path)
-    entries = data.get("entries")
-    if not isinstance(entries, list):
-        entries = []
-    data["entries"] = entries
-    data.setdefault("version", 1)
-    record = {
-        "id": SERVER_NAME,
-        "name": SERVER_NAME,
-        "tier": "on-demand",
-        "transport": "stdio",
-        "command": entry["command"],
-        "args": list(entry["args"]),
-        "env": dict(entry["env"]),
-        "cwd": None,
-        "url": None,
-        "headers": {},
-        "notes": "installed by ssh-mcp installer",
-        "managed": True,
-    }
-    for index, existing in enumerate(entries):
-        if isinstance(existing, dict) and existing.get("id") == SERVER_NAME:
-            # Keep the client's own bookkeeping fields (timestamps, tool cache).
-            merged = {**existing, **record}
-            merged.pop("tools", None)
-            entries[index] = merged
-            break
+    raw = path.read_text(encoding="utf-8") if path.is_file() else ""
+    updated = _replace_dsh_mcp_block(raw, _render_dsh_row(entry))
+    if updated == raw:
+        return False
+    if dry_run:
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(updated, encoding="utf-8")
+    os.replace(tmp, path)
+    return True
+
+
+DSH_BLOCK_BEGIN = "# >>> dsh-skill-mcp-panel:mcp:begin"
+DSH_BLOCK_END = "# <<< dsh-skill-mcp-panel:mcp:end"
+# The panel names managed rows ``panel-mcp-<serverName>``; matching that keeps
+# the entry editable from its UI instead of showing up as a foreign row.
+DSH_ROW_ID = "panel-mcp-ssh"
+DSH_PLUGIN_NAME = "@deepseek-ai/dsh-mcp-client"
+
+
+def _yaml_scalar(value: str) -> str:
+    """Render ``value`` as a YAML scalar, quoting only when it is required.
+
+    Windows paths (``C:\\Users\\me\\python.exe``) are the common case and are
+    valid plain scalars; anything YAML would misread -- a leading ``@`` or
+    ``-``, an inner ``: ``/`` #``, braces, a leading quote -- is double-quoted
+    with JSON escaping, which is also valid YAML.
+    """
+    reserved_initials = "?&*!|>%@`\"'"
+    if value and value.strip() == value:
+        risky = value[0] in reserved_initials or (value[0] == "-" and (len(value) == 1 or value[1] == " "))
+        risky = risky or bool(re.search(r": | #|[\{\}\[\],\n\r\t]", value))
+        if not risky and value.lower() not in {"null", "true", "false", "yes", "no", "on", "off", "~"}:
+            return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _render_dsh_row(entry: dict[str, Any]) -> list[str]:
+    """The managed ``- id: panel-mcp-ssh`` row, indented under ``insert:``."""
+    args = [str(arg) for arg in entry["args"]]
+    lines = [
+        f"    - id: {DSH_ROW_ID}",
+        f"      name: \"{DSH_PLUGIN_NAME}\"",
+        "      config:",
+        "        serverName: ssh",
+        "        toolCallTimeoutMs: 60000",
+        "        failOnStartupError: false",
+        "        reconnect:",
+        "          enabled: true",
+        "          initialDelayMs: 500",
+        "          maxDelayMs: 30000",
+        "          maxAttempts: 10",
+        "        transport: stdio",
+        "        command: " + _yaml_scalar(entry["command"]),
+    ]
+    if args:
+        lines.append("        args:")
+        lines += ["          - " + _yaml_scalar(arg) for arg in args]
     else:
-        entries.append(record)
-    return _write_json(path, data, dry_run=dry_run)
+        lines.append("        args: []")
+    lines.append("        env:")
+    lines += [f"          {key}: {_yaml_scalar(value)}" for key, value in entry["env"].items()]
+    lines.append("        cwd: ''")
+    return lines
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _starts_item(line: str) -> bool:
+    return line.lstrip().startswith("- ")
+
+
+def _find_row_span(lines: list[str], row_id: str) -> tuple[int, int] | None:
+    """Span of the ``- id: <row_id>`` item in ``lines``, comments included.
+
+    The end is the next item at the same or a shallower indent, which covers
+    both places a row can sit: directly in the patch array (indent 0) and
+    inside an ``insert:`` list (indent 4).
+    """
+    marker = f"- id: {row_id}"
+    for index, line in enumerate(lines):
+        if not _starts_item(line) or line.strip() != marker:
+            continue
+        indent = _indent_of(line)
+        start = index
+        # Fold a comment directly above the row back into the replaced span so
+        # re-running does not stack stale notes.
+        while start > 0 and lines[start - 1].strip().startswith("#") and _indent_of(lines[start - 1]) >= indent:
+            start -= 1
+        end = index + 1
+        while end < len(lines):
+            probe = lines[end]
+            if probe.strip():
+                if _indent_of(probe) <= indent and _starts_item(probe):
+                    break
+                if _indent_of(probe) < indent and not probe.strip().startswith("- "):
+                    # Dedented scalar/comment: the item ended.
+                    break
+            end += 1
+        return start, end
+    return None
+
+
+def _find_insert_span(lines: list[str]) -> tuple[int, int] | None:
+    """Span of a top-level ``- insert:`` list, so rows can be appended to it."""
+    for index, line in enumerate(lines):
+        if line.strip() != "- insert:":
+            continue
+        indent = _indent_of(line)
+        end = index + 1
+        while end < len(lines):
+            probe = lines[end]
+            if probe.strip() and _indent_of(probe) <= indent and _starts_item(probe):
+                break
+            end += 1
+        return index, end
+    return None
+
+
+def _replace_dsh_mcp_block(raw: str, row: list[str]) -> str:
+    """Return ``raw`` with the managed MCP block holding ``row``.
+
+    Existing content inside the block is preserved line for line: other
+    servers the panel manages keep their exact text, and only the ssh item is
+    replaced. A file without a block gets one appended; the ``[]`` template the
+    web profile ships with is replaced outright, since ``[] - insert:`` is not
+    valid YAML.
+    """
+    block = [DSH_BLOCK_BEGIN, "- insert:", *row, DSH_BLOCK_END]
+    begin = raw.find(DSH_BLOCK_BEGIN)
+    end = raw.find(DSH_BLOCK_END)
+
+    if begin >= 0 and end > begin:
+        line_start = raw.rfind("\n", 0, begin) + 1
+        after_end = raw.find("\n", end)
+        line_end = len(raw) if after_end < 0 else after_end + 1
+        body = raw[begin + len(DSH_BLOCK_BEGIN) : end].splitlines()
+        # Blank lines right after the marker are layout, not content; dropping
+        # them keeps a second run from stacking another one each time.
+        while body and not body[0].strip():
+            body.pop(0)
+        while body and not body[-1].strip():
+            body.pop()
+        span = _find_row_span(body, DSH_ROW_ID)
+        if span is not None:
+            body = body[: span[0]] + row + body[span[1] :]
+        else:
+            insert = _find_insert_span(body)
+            if insert is not None:
+                body = body[: insert[1]] + row + body[insert[1] :]
+            else:
+                body = [*body, "- insert:", *row]
+        return raw[:line_start] + "\n".join([DSH_BLOCK_BEGIN, *body, DSH_BLOCK_END]) + "\n" + raw[line_end:]
+
+    if begin >= 0 or end >= 0:
+        raise SystemExit(
+            "cordis.patch.yml has an incomplete dsh-skill-mcp-panel block: "
+            "the begin/end comment markers must both be present"
+        )
+
+    if _is_empty_yaml_array(raw):
+        index = raw.rfind("[]")
+        return raw[:index] + "\n".join(block) + "\n" + raw[index + 2 :]
+
+    separator = "" if not raw else ("\n" if raw.endswith("\n") else "\n\n")
+    return raw + separator + "\n".join(block) + "\n"
+
+
+def _is_empty_yaml_array(raw: str) -> bool:
+    """Whether ``raw`` is only comments plus the flow-style empty array ``[]``."""
+    meaningful = [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
+    return meaningful == ["[]"]
 
 
 def _matches(label: str, wanted: set[str]) -> bool:
@@ -517,7 +679,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--clients",
         default="all",
-        help="comma-separated subset of: claude,cursor,vscode,desktop,all (default: all)",
+        help=(
+            "comma-separated substrings matched against client labels, e.g. claude,cursor,vscode,"
+            "windsurf,trae,qoder,workbuddy,dsh (default: all)"
+        ),
     )
     parser.add_argument("--skip-install", action="store_true", help="only write client configs")
     parser.add_argument(

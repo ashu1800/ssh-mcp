@@ -97,9 +97,35 @@ python scripts/install.py --mcp-key mcp_xxx
 - **Windsurf**：`~/.codeium/windsurf/mcp_config.json`
 - **Trae / Qoder**：`%APPDATA%\<App>\User\mcp.json`
 - **WorkBuddy**：`~/.workbuddy/mcp.json`
-- **DSH**：`~/.dsh/skill-mcp-manager/registry.json`（注册表格式，保留其余条目）
+- **DSH 桌面端 / Web 端**：各自 profile 的 `~/.dsh/profiles/{desktop,web}/cordis.patch.yml`
 
 客户端按「已安装才写」处理：配置文件、应用数据目录或可执行文件任一存在即视为已安装，否则跳过。
+
+### DSH 的两个端
+
+DSH 的桌面端与 Web 端是两套独立的 profile 根，各自从 `profiles/<name>/cordis.patch.yml` 读 MCP 服务器，
+所以两边都要写才会同时生效。脚本只动面板管的那一段：
+
+```yaml
+# >>> dsh-skill-mcp-panel:mcp:begin
+- insert:
+    - id: panel-mcp-ssh
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: ssh
+        transport: stdio
+        command: C:\...\ssh-mcp.exe
+        args:
+          - --transport
+          - stdio
+        env:
+          MCP_KEY: mcp_xxx
+# <<< dsh-skill-mcp-panel:mcp:end
+```
+
+同一文件里的其它插件配置、模型 provider 和其他 MCP 服务器（含它们的凭据）逐字节保留；
+重复运行只替换 `panel-mcp-ssh` 这一条。`~/.dsh/skill-mcp-manager/registry.json` 是面板根据这些行
+生成的缓存，不需要单独写。DSH 的 HMR 会热加载改动，桌面端若没反应重启一次即可。
 
 `--dry-run` 只报告会改哪些文件；`--skip-install` 只写配置；`--clients claude,cursor` 限定目标；
 `--from-wheel dist/xxx.whl` 在离线机器上安装。改动前会留 `.bak`，检测不到客户端的配置不会被创建。
