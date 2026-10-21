@@ -84,8 +84,15 @@ class ConnectionPool:
         self._entries: dict[tuple[str, int, str], PoolEntry] = {}
         self._by_handle: dict[str, tuple[str, int, str]] = {}
         self._map_lock = asyncio.Lock()
+        self._counters: dict[str, int] = {}
+        self._error_counts: dict[str, int] = {}
         self._reaper: asyncio.Task | None = None
         self._closed = False
+        # Handle the client most recently used, so tools can omit it. Only
+        # meaningful for a single-user transport (stdio); on the stateless HTTP
+        # transport one process serves many callers, and letting an omitted
+        # handle resolve to whoever connected last would cross sessions.
+        self._default_handle: str | None = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -189,7 +196,9 @@ class ConnectionPool:
         async with entry.lock:
             entry.server_id = server_id or str(payload.server_id)
             if entry.is_alive() and not force_new:
+                self.record("connections_reused")
                 entry.touch()
+                self._default_handle = entry.handle
                 return entry
 
             if entry.is_alive() and force_new:
@@ -209,6 +218,8 @@ class ConnectionPool:
                     port=payload.port,
                 ) from None
 
+            self.record("connections_established")
+            self.record(f"auth_{result.auth_method}")
             entry.conn = result.conn
             entry.auth_method = result.auth_method
             entry.compression = result.compression
@@ -223,20 +234,38 @@ class ConnectionPool:
                 if previous_handle != entry.handle:
                     self._by_handle.pop(previous_handle, None)
                 self._by_handle[entry.handle] = key
+            self._default_handle = entry.handle
             return entry
 
-    async def acquire(self, handle: str) -> Acquired:
-        """Borrow the entry behind ``handle`` for the duration of one tool call."""
+    async def acquire(self, handle: str | None) -> Acquired:
+        """Borrow the entry behind ``handle`` for the duration of one tool call.
+
+        ``None`` means "the connection this client used last". That is only
+        unambiguous on a single-user transport; the HTTP transport passes an
+        explicit handle on every call.
+        """
+        if handle is None:
+            handle = self._default_handle
+            if handle is None:
+                raise ConnectionMissing(None)
         key = self._by_handle.get(handle)
         if key is None:
             raise ConnectionMissing(handle)
         entry = self._entries.get(key)
         if entry is None or entry.handle != handle or not entry.is_alive():
+            if self._default_handle == handle:
+                self._default_handle = None
             raise ConnectionMissing(handle)
         entry.in_flight += 1
         entry.touch()
+        self._default_handle = handle
         assert entry.conn is not None
         return Acquired(entry=entry, conn=entry.conn, _pool=self)
+
+    def set_default(self, handle: str) -> None:
+        """Remember ``handle`` as the implicit target for later calls."""
+        if self._by_handle.get(handle) is not None:
+            self._default_handle = handle
 
     def release(self, entry: PoolEntry) -> None:
         entry.in_flight = max(0, entry.in_flight - 1)
@@ -270,6 +299,8 @@ class ConnectionPool:
             async with self._map_lock:
                 self._entries.pop(entry.key, None)
                 self._by_handle.pop(entry.handle, None)
+                if self._default_handle == entry.handle:
+                    self._default_handle = None
             await self._close_entry(entry)
         return key
 
@@ -289,7 +320,21 @@ class ConnectionPool:
                     "idle_seconds": round(time.monotonic() - entry.last_used, 1),
                 }
             )
-        return {"entries": entries, "count": len(entries)}
+        return {
+            "entries": entries,
+            "count": len(entries),
+            "max_entries": self._settings.pool_max_entries,
+            "default_handle": self._default_handle,
+            "counters": dict(self._counters),
+            "errors": dict(self._error_counts),
+        }
+
+    def record(self, name: str, amount: int = 1) -> None:
+        """Bump a lifetime counter, for the observability tool."""
+        self._counters[name] = self._counters.get(name, 0) + amount
+
+    def note_failure(self, error: str) -> None:
+        self._error_counts[error] = self._error_counts.get(error, 0) + 1
 
     # -- internals ------------------------------------------------------------
 
@@ -298,14 +343,38 @@ class ConnectionPool:
             entry = self._entries.get(key)
             if entry is not None:
                 return entry
+            # Cap the number of live connections. Rather than refusing at the
+            # limit, evict the least recently used *idle* entry: a pool that has
+            # grown to its ceiling is almost always holding connections nobody
+            # is using any more.
+            if len(self._entries) >= self._settings.pool_max_entries:
+                victim = self._pick_eviction_victim()
+                if victim is not None:
+                    self._entries.pop(victim.key, None)
+                    self._by_handle.pop(victim.handle, None)
+                    asyncio.create_task(self._close_entry(victim), name="ssh-mcp-pool-evict")
+                    logger.info(
+                        "pool at capacity (%d); evicted idle connection to %s@%s:%s",
+                        self._settings.pool_max_entries,
+                        victim.username,
+                        victim.host,
+                        victim.port,
+                    )
             entry = PoolEntry(key=key, handle=secrets.token_urlsafe(18))
             self._entries[key] = entry
             self._by_handle[entry.handle] = key
             return entry
 
+    def _pick_eviction_victim(self) -> PoolEntry | None:
+        """Least-recently-used entry that no tool call is currently using."""
+        idle = [entry for entry in self._entries.values() if entry.in_flight == 0]
+        if not idle:
+            return None
+        return min(idle, key=lambda entry: entry.last_used)
+
 
 @contextlib.asynccontextmanager
-async def borrow(pool: ConnectionPool, handle: str) -> AsyncIterator[Acquired]:
+async def borrow(pool: ConnectionPool, handle: str | None) -> AsyncIterator[Acquired]:
     acquired = await pool.acquire(handle)
     try:
         yield acquired

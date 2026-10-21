@@ -38,7 +38,6 @@ class TransferTools:
         )
         async def upload_file(
             ctx: Context,
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             local_path: Annotated[
                 str,
                 Field(description="本地文件路径（MCP 所在机器）。若设置了 SSH_MCP_ALLOWED_LOCAL_ROOTS，则必须位于其根目录内。"),
@@ -55,6 +54,10 @@ class TransferTools:
             ] = "size",
             create_parent_dirs: Annotated[bool, Field(description="为 true 时递归创建远端父目录。默认 false。")] = False,
             progress: Annotated[bool, Field(description="为 true 时按 1% 或 5 秒的节流频率上报传输进度。")] = True,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """把本地文件通过 SFTP 流式上传到远端，支持断点续传、原子落盘与完整性校验。
             返回 {bytes_transferred, resumed_from, total_bytes, verified, remote_path, local_path, duration_seconds}。
@@ -93,7 +96,6 @@ class TransferTools:
         )
         async def download_file(
             ctx: Context,
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             remote_path: Annotated[str, Field(description="远端文件路径，如 /var/log/app.log。")],
             local_path: Annotated[
                 str,
@@ -109,6 +111,10 @@ class TransferTools:
                 Field(description="完整性校验方式：size（默认）、sha256（大文件较慢）、none。"),
             ] = "size",
             progress: Annotated[bool, Field(description="为 true 时按 1% 或 5 秒的节流频率上报传输进度。")] = True,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """通过 SFTP 把远端文件流式下载到本地，支持断点续传、原子落盘与完整性校验。
             返回 {bytes_transferred, resumed_from, total_bytes, verified, remote_path, local_path, duration_seconds}。
@@ -122,7 +128,7 @@ class TransferTools:
                     )
                 )
             try:
-                local = resolve_local_target(self._settings, local_path)
+                local = resolve_local_target(self._settings, local_path, write=True)
                 async with borrow(self._pool, connection_handle) as acquired:
                     sftp = await acquired.sftp_client()
                     result = await self._engine.download(
@@ -146,7 +152,6 @@ class TransferTools:
         )
         async def upload_files(
             ctx: Context,
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             files: Annotated[list[FilePair], Field(description="待上传文件列表，每项包含 local_path 与 remote_path。")],
             overwrite: Annotated[bool, Field(description="目标已存在时是否覆盖。默认 false，会在传输前对每个文件单独拒绝。")] = False,
             confirm: Annotated[bool, Field(description="overwrite=true 时必须同时传 confirm=true。")] = False,
@@ -155,6 +160,10 @@ class TransferTools:
                 Literal["size", "sha256", "none"], Field(description="完整性校验方式，默认 size。")
             ] = "size",
             create_parent_dirs: Annotated[bool, Field(description="为 true 时递归创建每个远端父目录。默认 false。")] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """并发上传多个文件，按配置的并发上限（默认 4）限流，每个文件独立续传、校验与原子落盘。
             返回 {results: [{local_path, remote_path, ok, ...}], succeeded, failed}；单个文件失败不影响其余文件。
@@ -182,7 +191,6 @@ class TransferTools:
         )
         async def download_files(
             ctx: Context,
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             files: Annotated[list[FilePair], Field(description="待下载文件列表，每项包含 remote_path 与 local_path。")],
             overwrite: Annotated[bool, Field(description="本地文件已存在时是否覆盖。默认 false。")] = False,
             confirm: Annotated[bool, Field(description="overwrite=true 时必须同时传 confirm=true。")] = False,
@@ -190,6 +198,10 @@ class TransferTools:
             verify: Annotated[
                 Literal["size", "sha256", "none"], Field(description="完整性校验方式，默认 size。")
             ] = "size",
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """并发下载多个文件，按配置的并发上限限流，每个文件独立续传、校验与原子落盘。
             返回 {results: [{local_path, remote_path, ok, ...}], succeeded, failed}；单个文件失败不影响其余文件。
@@ -259,7 +271,11 @@ class TransferTools:
         async def one(index: int, pair: FilePair) -> None:
             async with semaphore:
                 try:
-                    local = resolve_local_target(self._settings, pair.local_path)
+                    # A download creates the local file, so it answers to the
+                    # write allowlist; an upload only reads.
+                    local = resolve_local_target(
+                        self._settings, pair.local_path, write=direction == "download"
+                    )
                     sftp = await acquired.sftp_client()
                     # Both engine methods take (sftp, local, remote) opposite
                     # ways; normalise once so the branch cannot swap them.

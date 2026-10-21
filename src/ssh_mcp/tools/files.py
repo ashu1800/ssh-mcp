@@ -73,15 +73,18 @@ class FileTools:
         @app.tool(
             name="list_directory",
             title="列出远端目录内容",
-            annotations={"readOnlyHint": True, "openWorldHint": True},
+            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         )
         async def list_directory(
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             path: Annotated[str, Field(description="远端目录路径，默认当前用户主目录。")] = ".",
             max_entries: Annotated[
                 int, Field(description="返回的最大条目数，默认取服务配置（500），超出部分通过 truncated 标记。")
             ] = 0,
             include_hidden: Annotated[bool, Field(description="为 false 时跳过以 . 开头的隐藏条目。默认 true。")] = True,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """列出远端目录下的条目及其类型、大小、权限与修改时间，不递归、不返回文件内容。
             返回 {path, entries: [{name, type, size, mode, modified_at}], total, truncated}。
@@ -138,12 +141,15 @@ class FileTools:
         @app.tool(
             name="stat_file",
             title="查询远端文件元信息",
-            annotations={"readOnlyHint": True, "openWorldHint": True},
+            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         )
         async def stat_file(
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             path: Annotated[str, Field(description="远端文件或目录路径。")],
             follow_symlinks: Annotated[bool, Field(description="为 false 时查询符号链接本身的属性。默认 true。")] = True,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """查询远端单个路径的属性：类型、大小、权限、属主与修改时间，不读取文件内容。
             返回 {path, type, size, permissions, mode, owner, group, modified_at}。
@@ -165,12 +171,20 @@ class FileTools:
         @app.tool(
             name="make_directory",
             title="创建远端目录",
-            annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+            annotations={
+                "readOnlyHint": False,
+                "destructiveHint": False,
+                "idempotentHint": True,  # an existing directory is success
+                "openWorldHint": True,
+            },
         )
         async def make_directory(
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             path: Annotated[str, Field(description="要创建的远端目录路径。")],
             parents: Annotated[bool, Field(description="为 true 时递归创建缺失的父目录。默认 false。")] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """在远端创建一个目录，可选递归创建父目录；已存在的目录视为成功。
             返回 {path, created, created_parents}。
@@ -250,10 +264,13 @@ class FileTools:
             annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
         )
         async def remove_path(
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             path: Annotated[str, Field(description="要删除的远端文件或目录路径。")],
             recursive: Annotated[bool, Field(description="为 true 时递归删除目录及其全部内容。默认 false，仅删除空目录。")] = False,
             confirm: Annotated[bool, Field(description="破坏性操作，必须为 true 才会执行。")] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """删除远端文件、符号链接或目录（默认仅限空目录），返回删除的类型与路径。
             递归删除会连同子目录中的全部内容一起永久删除，且无法恢复。
@@ -306,11 +323,14 @@ class FileTools:
             annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
         )
         async def rename_path(
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             old_path: Annotated[str, Field(description="远端原路径。")],
             new_path: Annotated[str, Field(description="远端新路径（可跨目录移动）。")],
             overwrite: Annotated[bool, Field(description="目标已存在时是否覆盖。默认 false，会直接拒绝。")] = False,
             confirm: Annotated[bool, Field(description="覆盖目标或移动目录属于破坏性操作，必须为 true 才会执行。")] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """在远端重命名或移动文件/目录，目标已存在时默认拒绝，除非 overwrite=true。
             返回 {old_path, new_path, overwritten}。
@@ -372,11 +392,14 @@ class FileTools:
             annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
         )
         async def change_permissions(
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             path: Annotated[str, Field(description="远端文件或目录路径。")],
             mode: Annotated[str, Field(description="八进制权限字符串，如 \"644\"、\"755\"、\"600\"。")],
             recursive: Annotated[bool, Field(description="为 true 时递归应用到目录下的所有条目。默认 false。")] = False,
             confirm: Annotated[bool, Field(description="破坏性操作，必须为 true 才会执行。")] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """修改远端文件或目录的 POSIX 权限位，返回新权限与受影响的条目数。
             权限设置错误可能导致服务无法访问文件或暴露敏感数据。

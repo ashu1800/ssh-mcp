@@ -98,3 +98,50 @@ def test_toml_list_sets_the_roots(tmp_path: Path):
     settings = load_settings({"MCP_KEY": TOKEN, "SSH_MCP_STATE_DIR": str(tmp_path), "SSH_MCP_CONFIG": str(config)})
     assert settings.local_paths_restricted is True
     assert settings.allowed_local_roots[0].name == "only"
+
+
+# -- write-only allowlist -----------------------------------------------------
+
+
+def test_write_roots_confine_writes_but_not_reads(tmp_path: Path):
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    settings = _settings(write_local_roots=[safe])
+
+    # Writing anywhere else is refused...
+    with pytest.raises(Exception) as excinfo:
+        settings.resolve_local_path(str(tmp_path / "elsewhere" / "f.bin"), write=True)
+    assert "允许写入" in str(excinfo.value)
+    # ...but reading there is still allowed, which is the whole point.
+    assert settings.resolve_local_path(str(tmp_path / "elsewhere" / "f.bin")) == (
+        tmp_path / "elsewhere" / "f.bin"
+    ).resolve(strict=False)
+    # And writing inside the safe root works.
+    assert settings.resolve_local_path(str(safe / "f.bin"), write=True) == (safe / "f.bin").resolve(strict=False)
+
+
+def test_write_roots_do_not_unlock_the_read_allowlist(tmp_path: Path):
+    """Both lists apply: a write root outside the read roots is still a read failure."""
+    readable = tmp_path / "readable"
+    writable = tmp_path / "writable"
+    readable.mkdir()
+    writable.mkdir()
+    settings = _settings(allowed_local_roots=[readable], write_local_roots=[writable])
+
+    # Inside the write root, so the write check passes...
+    assert settings.resolve_local_path(str(writable / "f"), write=True) == (writable / "f").resolve(strict=False)
+    # ...but a plain read of it is outside the read roots.
+    with pytest.raises(Exception):
+        settings.resolve_local_path(str(writable / "f"))
+
+
+def test_env_sets_write_roots(tmp_path: Path):
+    settings = load_settings(
+        {
+            "MCP_KEY": TOKEN,
+            "SSH_MCP_STATE_DIR": str(tmp_path),
+            "SSH_MCP_WRITE_LOCAL_ROOTS": str(tmp_path / "downloads"),
+        }
+    )
+    assert settings.local_writes_restricted is True
+    assert settings.local_paths_restricted is False

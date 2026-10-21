@@ -27,7 +27,6 @@ class ExecTools:
             annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
         )
         async def execute_command(
-            connection_handle: Annotated[str, Field(description="connect 返回的 connection_handle。")],
             command: Annotated[str, Field(description="要执行的非交互式 shell 命令，例如 `uname -a` 或 `df -h`。")],
             timeout_seconds: Annotated[
                 float | None,
@@ -46,6 +45,10 @@ class ExecTools:
                     )
                 ),
             ] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
         ) -> CallToolResult:
             """在已连接的服务器上执行一条非交互式命令，返回 stdout、stderr、退出码与截断标记。
             返回 {stdout, stderr, exit_code, exit_signal, truncated, stdout_total_bytes, duration_seconds}；

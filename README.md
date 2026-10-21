@@ -64,7 +64,9 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MCP_KEY` | 必填 | 调接口与派生解密密钥 |
-| `SSH_MCP_ALLOWED_LOCAL_ROOTS` | 空（不限制） | 可选。设置后本地传输只允许这些目录（`os.pathsep` 分隔，realpath 校验，symlink 解析后判断）；不设置则不限路径 |
+| `SSH_MCP_ALLOWED_LOCAL_ROOTS` | 空（不限制） | 可选。设置后本地**读写**都只允许这些目录（`os.pathsep` 分隔，realpath 校验，symlink 解析后判断） |
+| `SSH_MCP_WRITE_LOCAL_ROOTS` | 空（不限制） | 可选。只限制**写入**（下载落盘）的目录，读取不受影响 —— 推荐用它代替上面那条，既能读构建产物又不会污染其它目录 |
+| `SSH_MCP_POOL_MAX_ENTRIES` | 64 | 同时保持的 SSH 连接上限，超限时淘汰最久未用的空闲连接 |
 | `SSH_MCP_STATE_DIR` | `~/.ssh-mcp` | known_hosts、Ed25519 私钥、认证状态 |
 | `SSH_MCP_SFTP_BLOCK_SIZE` | 256 KiB | SFTP 请求流水线块大小 |
 | `SSH_MCP_SFTP_IDLE_TIMEOUT` | 60 s | 连续无数据即中止（大文件主超时） |
@@ -280,8 +282,34 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 | `remove_path` | 删除文件/空目录（递归需显式） | ✓ |
 | `rename_path` | 重命名/移动 | ✓ |
 | `change_permissions` | 改权限（八进制） | ✓ |
+| `get_connection_stats` | 连接池与运行计数 | – |
 
-所有工具返回结构化 JSON；失败时 `is_error=true`，字段含 `error`、`stage`、`hint`、`retryable`。
+### 语义化运维工具
+
+下面这些不是"多几个工具"，而是**把容易写错的 shell 拼装固化下来**。AI 直接说"nginx 在跑吗"即可，
+不必自己拼 `systemctl | grep`，也就不会踩到分页器、`-f` 跟随、引号里带 `|` 这类坑。
+
+| 工具 | 用途 |
+|---|---|
+| `get_service_status` | 单个 systemd 服务的状态、自启、PID、重启次数、最近 20 行日志 |
+| `list_services` | 按 running / failed 列出服务 |
+| `tail_log` | 日志尾部，支持 `journalctl -u` 或文件 `tail -n`，**永不跟随** |
+| `get_disk_usage` | 各挂载点使用率，≥85% 时给出 warning |
+| `get_system_overview` | 主机名、内核、发行版、uptime、负载、内存、CPU 数 |
+| `list_processes` | 按 CPU/内存排序的进程列表（批处理版 top） |
+| `list_listening_ports` | 监听端口及占用进程 |
+
+### 省略 connection_handle
+
+`connect` 之后，后续工具可以**不传** `connection_handle`，默认用最近一次使用的连接。
+适合"一连上就连续操作同一台机器"的场景，省掉每次复制 handle。多台机器交替操作时仍应显式传。
+
+> 该默认值只在 stdio（单用户）下有意义；HTTP 传输是无状态的，多个调用方共用一个进程，
+> 省略 handle 会串号，因此 HTTP 场景请始终显式传。
+
+所有工具返回结构化 JSON；失败时 `is_error=true`，字段含 `error`、`stage`、`hint`、`retryable` 与
+`next_actions`（机器可读的下一步，如 `call_connect`、`ask_user_then_retry_with_confirm`）。
+工具同时带 MCP 注解：`readOnlyHint`（只读）、`destructiveHint`（破坏性）、`idempotentHint`（重复执行结果一致）。
 
 ## 传输语义
 
@@ -293,8 +321,8 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 ## 安全
 
 - 密码/私钥只在内存；日志过滤器会脱敏 `mcp_` 令牌、PEM 私钥与 `password` 字段。
-- 本地传输默认**不限制路径**（AI 可以直接上传构建产物）；设置 `SSH_MCP_ALLOWED_LOCAL_ROOTS` 后经 `realpath`
-  校验必须落在其内，symlink 逃逸同样拒绝。见「已知取舍」第 4 条。
+- 本地传输默认**不限制路径**（AI 可以直接上传构建产物）；`SSH_MCP_WRITE_LOCAL_ROOTS` 只约束写入，
+  `SSH_MCP_ALLOWED_LOCAL_ROOTS` 同时约束读写，两者都经 `realpath` 校验且拒绝 symlink 逃逸。见「已知取舍」第 4 条。
 - `known_hosts` 位于 `~/.ssh-mcp/known_hosts`；首次信任后指纹变化会拒绝连接。
 - HTTP 默认绑定 `127.0.0.1`，校验 `Origin`，可要求 Bearer；绑定非回环地址而未设置 Token 时拒绝启动。
 - 私钥文件 600、目录 700（Windows 上权限位语义有限，依赖文件系统 ACL）。

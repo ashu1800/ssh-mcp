@@ -21,21 +21,34 @@ async def tools(settings):
 async def test_all_expected_tools_are_registered(tools):
     names = {tool.name for tool in tools}
     assert names == {
+        # discovery / connection lifecycle
         "list_servers",
         "resolve_server",
         "connect",
         "disconnect",
+        "get_connection_stats",
+        # raw execution and transfers
         "execute_command",
         "upload_file",
         "download_file",
         "upload_files",
         "download_files",
+        # remote filesystem
         "list_directory",
         "stat_file",
         "make_directory",
         "remove_path",
         "rename_path",
         "change_permissions",
+        # semantic inspection: these exist so the model does not have to
+        # assemble shell pipelines itself
+        "get_service_status",
+        "list_services",
+        "tail_log",
+        "get_disk_usage",
+        "get_system_overview",
+        "list_processes",
+        "list_listening_ports",
     }
 
 

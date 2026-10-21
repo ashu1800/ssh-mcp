@@ -387,3 +387,34 @@ async def test_non_interactive_invocations_are_allowed(app, command):
         app, "execute_command", connection_handle=connect["connection_handle"], command=command
     )
     assert payload.get("error") != "interactive_command_rejected"
+
+
+@pytest.mark.asyncio
+async def test_connection_handle_can_be_omitted_after_connect(app):
+    """connect establishes the implicit target, so later calls need no handle."""
+    await call(app, "connect", server_id="1")
+    payload, is_error = await call(app, "get_system_overview")
+    # The fake server's shell answers only a few builtins, so the parsed fields
+    # may be empty; what matters is that the handle resolved at all.
+    assert payload.get("error") != "connection_not_found"
+    assert is_error is False or "error" not in payload
+
+
+@pytest.mark.asyncio
+async def test_omitted_handle_without_a_connection_is_actionable(app):
+    payload, is_error = await call(app, "get_system_overview")
+    assert is_error is True
+    assert payload["error"] == "connection_not_found"
+    assert payload["next_actions"] == ["call_connect"]
+    assert "先调用 connect" in payload["hint"]
+
+
+@pytest.mark.asyncio
+async def test_connection_stats_reports_the_pool(app):
+    await call(app, "connect", server_id="1")
+    payload, is_error = await call(app, "get_connection_stats")
+    assert is_error is False
+    assert payload["count"] == 1
+    assert payload["counters"]["connections_established"] >= 1
+    entry = payload["entries"][0]
+    assert set(entry) >= {"host", "port", "username", "alive", "in_flight"}

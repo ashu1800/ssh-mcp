@@ -127,6 +127,9 @@ class Settings:
     keys_dir: Path | None = None
     allowed_local_roots: list[Path] = field(default_factory=list)
     resolved_local_roots: list[Path] = field(default_factory=list)
+    # Writes only; lets reads stay open while download targets are confined.
+    write_local_roots: list[Path] = field(default_factory=list)
+    resolved_write_roots: list[Path] = field(default_factory=list)
     # --- ssh -----------------------------------------------------------------
     connect_timeout: float = 10.0
     login_timeout: float = 20.0
@@ -134,6 +137,7 @@ class Settings:
     keepalive_count_max: int = 3
     pool_idle_timeout: float = 300.0
     pool_reaper_interval: float = 60.0
+    pool_max_entries: int = 64
     compression_mode: str = "auto"  # auto | on | off
 
     # --- commands ------------------------------------------------------------
@@ -181,6 +185,8 @@ class Settings:
         # Resolved lazily and once: each ``Path.resolve`` stats every component,
         # and a 200-file batch would otherwise re-walk every root 200 times.
         self.resolved_local_roots = [p.resolve(strict=False) for p in self.allowed_local_roots]
+        self.write_local_roots = [p.expanduser() for p in self.write_local_roots]
+        self.resolved_write_roots = [p.resolve(strict=False) for p in self.write_local_roots]
 
     @property
     def http_is_loopback(self) -> bool:
@@ -191,13 +197,23 @@ class Settings:
         """Whether local transfers are confined to :attr:`allowed_local_roots`."""
         return bool(self.resolved_local_roots)
 
-    def resolve_local_path(self, raw: str) -> Path:
+    @property
+    def local_writes_restricted(self) -> bool:
+        """Whether local *writes* are confined to :attr:`write_local_roots`."""
+        return bool(self.resolved_write_roots)
+
+    def resolve_local_path(self, raw: str, *, write: bool = False) -> Path:
         """Return the realpath for ``raw``, rejecting anything outside the allowlist.
 
+        Two independent lists, checked in order:
+
+        * ``SSH_MCP_ALLOWED_LOCAL_ROOTS`` -- caps *both* reads and writes.
+        * ``SSH_MCP_WRITE_LOCAL_ROOTS`` -- caps writes only, so an upload can
+          read from anywhere while a download cannot land in, say, ``~/.ssh``.
+
         Symlinks are resolved before the containment check, so a link inside an
-        allowed root that points outside it is rejected. With no roots
-        configured the path is returned unrestricted -- see
-        :attr:`local_paths_restricted`.
+        allowed root that points outside it is rejected. With neither list set
+        the path is returned unrestricted.
         """
         if "\x00" in raw:
             raise PathNotAllowed(raw, "路径包含 NUL 字符")
@@ -207,6 +223,13 @@ class Settings:
         # ``resolve()`` follows symlinks where they exist and normalises the
         # rest, which is what the containment check must see.
         resolved = candidate.resolve(strict=False)
+
+        if write and self.resolved_write_roots:
+            if any(resolved == root or resolved.is_relative_to(root) for root in self.resolved_write_roots):
+                return resolved
+            allowed = ", ".join(str(r) for r in self.write_local_roots)
+            raise PathNotAllowed(raw, f"路径不在允许写入的本地目录内：{allowed}")
+
         if not self.resolved_local_roots:
             return resolved
         for root_resolved in self.resolved_local_roots:
@@ -254,6 +277,18 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
             # the build output it was asked to upload".
             allowed_roots = []
 
+    write_roots_raw = src.env("SSH_MCP_WRITE_LOCAL_ROOTS")
+    if write_roots_raw is not None:
+        write_roots = _split_paths(write_roots_raw)
+    else:
+        toml_write = src.toml("write_local_roots")
+        if isinstance(toml_write, list):
+            write_roots = [Path(str(p)).expanduser() for p in toml_write]
+        elif isinstance(toml_write, str):
+            write_roots = _split_paths(toml_write)
+        else:
+            write_roots = []
+
     total_raw = src.env("SSH_MCP_SFTP_TOTAL_TIMEOUT")
     if total_raw is None:
         toml_total = src.toml("sftp_total_timeout")
@@ -289,12 +324,15 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         auth_state_path=_optional_path(src.env("SSH_MCP_AUTH_STATE")),
         keys_dir=_optional_path(src.env("SSH_MCP_KEYS_DIR")),
         allowed_local_roots=allowed_roots,
+        write_local_roots=write_roots,
         connect_timeout=src.number("SSH_MCP_CONNECT_TIMEOUT", "connect_timeout", 10.0, minimum=1.0),
         login_timeout=src.number("SSH_MCP_LOGIN_TIMEOUT", "login_timeout", 20.0, minimum=1.0),
         keepalive_interval=src.number("SSH_MCP_KEEPALIVE_INTERVAL", "keepalive_interval", 30.0, minimum=0.0),
         keepalive_count_max=src.integer("SSH_MCP_KEEPALIVE_COUNT_MAX", "keepalive_count_max", 3, minimum=1),
         pool_idle_timeout=src.number("SSH_MCP_POOL_IDLE_TIMEOUT", "pool_idle_timeout", 300.0, minimum=0.0),
         pool_reaper_interval=src.number("SSH_MCP_POOL_REAPER_INTERVAL", "pool_reaper_interval", 60.0, minimum=1.0),
+        # Ceiling on live SSH connections; idle LRU entries are evicted first.
+        pool_max_entries=src.integer("SSH_MCP_POOL_MAX_ENTRIES", "pool_max_entries", 64, minimum=1),
         compression_mode=compression_mode,
         command_timeout_default=src.number("SSH_MCP_COMMAND_TIMEOUT_DEFAULT", "command_timeout_default", 30.0, minimum=1.0),
         command_timeout_max=src.number("SSH_MCP_COMMAND_TIMEOUT_MAX", "command_timeout_max", 600.0, minimum=1.0),

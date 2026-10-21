@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 from mcp.types import CallToolResult, TextContent
@@ -42,8 +43,23 @@ def tool_ok(payload: dict[str, Any]) -> CallToolResult:
     return CallToolResult(content=[TextContent(type="text", text=body)], structured_content=payload)
 
 
+# Set by :func:`ssh_mcp.server.create_server`; None when tools run standalone.
+_error_sink: "Callable[[str], None] | None" = None
+
+
+def set_error_sink(sink: "Callable[[str], None] | None") -> None:
+    """Install a callback that counts failures by error code."""
+    global _error_sink
+    _error_sink = sink
+
+
 def tool_err(failure: ToolFailure) -> CallToolResult:
     """Return a structured error result (``is_error=True``)."""
+    if _error_sink is not None:
+        try:
+            _error_sink(failure.error)
+        except Exception:  # noqa: BLE001 - counting must never break a response
+            pass
     return _result(failure.to_dict(), is_error=True)
 
 

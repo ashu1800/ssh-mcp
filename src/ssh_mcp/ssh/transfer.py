@@ -841,10 +841,14 @@ async def _sha256_remote_sftp(sftp: asyncssh.SFTPClient, path: str) -> str:
     return digest.hexdigest()
 
 
-def resolve_local_target(settings: Settings, raw: str) -> Path:
-    """Allowlist-checked local path for a transfer target."""
+def resolve_local_target(settings: Settings, raw: str, *, write: bool = False) -> Path:
+    """Allowlist-checked local path for a transfer target.
+
+    ``write=True`` for downloads: they create a file locally, so they answer to
+    the write allowlist as well.
+    """
     try:
-        return settings.resolve_local_path(raw)
+        return settings.resolve_local_path(raw, write=write)
     except PathNotAllowed as exc:
         raise ToolFailure(
             "path_not_allowed",
@@ -852,5 +856,7 @@ def resolve_local_target(settings: Settings, raw: str) -> Path:
             hint=exc.reason,
             retryable=False,
             local_path=raw,
-            allowed_roots=[str(p) for p in settings.allowed_local_roots],
+            allowed_roots=[
+                str(p) for p in (settings.write_local_roots if write else settings.allowed_local_roots)
+            ],
         ) from None

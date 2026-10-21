@@ -26,6 +26,7 @@ from ssh_mcp.ssh.pool import ConnectionPool
 from ssh_mcp.ssh.transfer import SftpTransferEngine
 from ssh_mcp.tools.exec import ExecTools
 from ssh_mcp.tools.files import FileTools
+from ssh_mcp.tools.ops import OpsTools
 from ssh_mcp.tools.servers import ServerTools
 from ssh_mcp.tools.transfer_tools import TransferTools
 
@@ -100,10 +101,16 @@ def create_server(settings: Settings, *, state: AppState | None = None) -> MCPSe
     runner = CommandRunner(settings, conn_pool)
     engine = SftpTransferEngine(settings)
 
+    # Count failures by code so get_connection_stats can show what is going wrong.
+    from ssh_mcp.tools.helpers import set_error_sink
+
+    set_error_sink(conn_pool.note_failure)
+
     ServerTools(app, creds, conn_pool)
     ExecTools(app, runner)
     TransferTools(app, conn_pool, engine, settings)
     FileTools(app, conn_pool, settings)
+    OpsTools(app, conn_pool, runner)
 
     app._ssh_mcp_state = owned_state  # type: ignore[attr-defined]
     return app

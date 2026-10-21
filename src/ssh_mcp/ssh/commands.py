@@ -219,7 +219,7 @@ class CommandRunner:
 
     async def run(
         self,
-        handle: str,
+        handle: str | None,
         command: str,
         *,
         timeout_seconds: float | None = None,

@@ -26,7 +26,7 @@ class ServerTools:
         @app.tool(
             name="list_servers",
             title="列出可连接的服务器",
-            annotations={"readOnlyHint": True, "openWorldHint": True},
+            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         )
         async def list_servers(
             refresh: Annotated[
@@ -48,7 +48,7 @@ class ServerTools:
         @app.tool(
             name="resolve_server",
             title="解析服务器的连接摘要",
-            annotations={"readOnlyHint": True, "openWorldHint": True},
+            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         )
         async def resolve_server(
             server_id: Annotated[str, Field(description="服务器 ID，来自 list_servers 返回的 server_id。")],
@@ -66,7 +66,12 @@ class ServerTools:
         @app.tool(
             name="connect",
             title="建立或复用 SSH 连接",
-            annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+            annotations={
+                "readOnlyHint": False,
+                "destructiveHint": False,
+                "idempotentHint": True,  # reuses the live connection
+                "openWorldHint": True,
+            },
         )
         async def connect(
             server_id: Annotated[str, Field(description="服务器 ID，来自 list_servers 返回的 server_id。")],
@@ -134,3 +139,15 @@ class ServerTools:
             except ToolFailure as exc:
                 return tool_err(exc)
             return tool_ok({"status": "disconnected", "host": host, "port": port, "username": username})
+
+        @app.tool(
+            name="get_connection_stats",
+            title="查看连接池与运行统计",
+            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
+        )
+        async def get_connection_stats() -> CallToolResult:
+            """查看当前连接池状态（每条连接的存活、空闲时长、是否在用）与本进程的累计计数。
+            返回 {entries: [...], count, max_entries, default_handle, counters, errors}。
+            Use when 排查连接泄漏、确认是否复用了连接，或了解有多少条连接正开着。
+            """
+            return tool_ok(self._pool.stats())
