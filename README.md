@@ -99,6 +99,19 @@ python scripts/install.py --mcp-key mcp_xxx
 `--dry-run` 只报告会改哪些文件；`--skip-install` 只写配置；`--clients claude,cursor` 限定目标；
 `--from-wheel dist/xxx.whl` 在离线机器上安装。改动前会留 `.bak`，检测不到客户端的配置不会被创建。
 
+### 无需先 clone 的两条命令
+
+```bash
+pip install --user "git+https://github.com/ashu1800/ssh-mcp.git"
+```
+
+```bash
+python -c "import urllib.request,pathlib,subprocess,sys; p=pathlib.Path.home()/'.ssh-mcp-install.py'; p.write_bytes(urllib.request.urlopen('https://raw.githubusercontent.com/ashu1800/ssh-mcp/main/scripts/install.py').read()); sys.exit(subprocess.call([sys.executable,str(p),'--mcp-key','mcp_xxx','--skip-install']))"
+```
+
+第一条装包，第二条把密钥写进各客户端配置（`--skip-install` 表示只写配置）。密钥只落在客户端配置文件里，
+不出现在进程列表或日志中；之后可删除 `~/.ssh-mcp-install.py`。
+
 ## 客户端配置
 
 `command` 必须是**绝对路径或 PATH 中的可执行文件名**——MCP 客户端不会继承你终端里的虚拟环境激活状态。

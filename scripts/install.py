@@ -68,9 +68,9 @@ def install_package(args: argparse.Namespace, repo: Path) -> tuple[str, str]:
     if args.skip_install:
         if args.from_wheel:
             raise SystemExit("--skip-install cannot be combined with --from-wheel")
-        existing = shutil.which("ssh-mcp")
+        existing = shutil.which("ssh-mcp") or _console_script_via_pip([sys.executable, "-m", "pip"])
         if existing:
-            return existing, "existing ssh-mcp on PATH"
+            return existing, "existing ssh-mcp installation"
         if args.venv:
             python = _venv_python(Path(args.venv).expanduser())
             if python.is_file():
@@ -96,18 +96,52 @@ def install_package(args: argparse.Namespace, repo: Path) -> tuple[str, str]:
         if not wheel.is_file():
             raise SystemExit(f"wheel not found: {wheel}")
         requirement = str(wheel)
+    elif args.package:
+        # Installed without a checkout: the script ran from a downloaded copy,
+        # so the source tree next to it is not this project.
+        requirement = args.package
     else:
         requirement = str(repo)
     print(f"installing {requirement} ...")
     subprocess.run([*pip_cmd, "--quiet", requirement], check=True)
 
-    # Under a virtualenv, prefer the console script; otherwise ``python -m ssh_mcp``.
+    # Prefer the console script: it pins the interpreter that actually has the
+    # package, whereas a bare ``python`` may resolve to a different one later.
     if args.venv:
         script = Path(args.venv).expanduser() / ("Scripts/ssh-mcp.exe" if os.name == "nt" else "bin/ssh-mcp")
         command = str(script) if script.is_file() else target
     else:
-        command = shutil.which("ssh-mcp") or target
+        # ``pip install --user`` puts the script outside the interpreter's own
+        # bin dir, so ask pip where it landed before falling back to PATH.
+        command = shutil.which("ssh-mcp") or _console_script_via_pip(pip_cmd[:2] + ["-m", "pip"]) or target
     return command, f"installed from {requirement}"
+
+
+def _console_script_via_pip(pip_prefix: list[str]) -> str | None:
+    """Ask pip where ``ssh-mcp`` was installed, if it knows."""
+    try:
+        proc = subprocess.run(
+            [*pip_prefix, "show", "--files", "ssh-mcp"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    location: Path | None = None
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Location:"):
+            location = Path(stripped.split(":", 1)[1].strip())
+            continue
+        if not stripped.endswith(("ssh-mcp", "ssh-mcp.exe", "ssh-mcp-script.py")):
+            continue
+        # pip reports paths relative to the install location (``..\Scripts\...``).
+        candidate = Path(stripped)
+        for base in ([location] if location else []) + [None]:
+            resolved = candidate if base is None else (base / candidate)
+            if resolved.is_file():
+                return str(resolved.resolve())
+    return None
 
 
 def verify_install(command: str) -> None:
@@ -332,8 +366,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mcp-key", required=True, help="MCP key issued by the server management service")
     parser.add_argument(
         "--venv",
-        default=str(Path(__file__).resolve().parent.parent / ".venv"),
-        help="virtualenv to install into (default: <repo>/.venv); pass an empty string to use the current interpreter",
+        default=None,
+        help=(
+            "virtualenv to install into; default is <repo>/.venv when run from a checkout and "
+            "the current interpreter otherwise. Pass an empty string to force the current interpreter"
+        ),
+    )
+    parser.add_argument(
+        "--package",
+        help="pip requirement to install instead of the local checkout (e.g. git+https://github.com/ashu1800/ssh-mcp.git)",
     )
     parser.add_argument("--from-wheel", help="install this wheel instead of the local source tree")
     parser.add_argument("--allowed-roots", default=DEFAULT_ROOTS, help="directories the AI may read/write locally")
@@ -355,6 +396,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--mcp-key does not look like an MCP token (expected a 'mcp_' prefix)")
 
     repo = Path(__file__).resolve().parent.parent
+    checkout = (repo / "pyproject.toml").is_file()
+    if args.venv is None:
+        # A downloaded copy of this script sits next to no project; installing
+        # into a venv there would be pointless, so use the running interpreter.
+        args.venv = str(repo / ".venv") if checkout else ""
+    if not checkout and not (args.package or args.from_wheel or args.skip_install):
+        raise SystemExit(
+            "this script is not running from a project checkout; "
+            "pass --package git+https://github.com/ashu1800/ssh-mcp.git (or --from-wheel)"
+        )
     wanted = {part.strip().lower() for part in args.clients.split(",") if part.strip()}
 
     result = InstallResult()
