@@ -327,11 +327,41 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 - HTTP 默认绑定 `127.0.0.1`，校验 `Origin`，可要求 Bearer；绑定非回环地址而未设置 Token 时拒绝启动。
 - 私钥文件 600、目录 700（Windows 上权限位语义有限，依赖文件系统 ACL）。
 
-## 测试
+## 开发
+
+**所有开发操作都走这一个入口**，不要手动 `pip install -e .`：
 
 ```bash
-pytest -q                                        # 离线套件（本地假 SSH/SFTP 服务）
-SSH_MCP_RUN_LARGE=1 pytest -m large -q           # 1 GB 内存基线
+make dev          # 首次：建 venv、装依赖、把 src/ 放到 import 路径
+make test         # 跑测试（自动校验真的在跑 src/，否则直接拒绝）
+make doctor       # 体检：当前 import 到哪份代码、有没有残留、有没有进程占用
+make install      # 拉了新代码后刷新依赖
+make serve        # 用 src/ 起服务
+make clean        # 清 build/缓存/pip 残留
+```
+
+Windows 上没有 GNU make 时，用等价命令：`python scripts/dev.py setup|test|doctor|install|serve|clean`。
+
+### 为什么不用 `pip install -e .`
+
+两个坑，都踩过：
+
+1. **Windows 不允许替换正在运行的 exe。** MCP 客户端把 `Scripts/ssh-mcp.exe` 一直开着，pip 重建它时
+   `[WinError 32]` 失败。更糟的是 pip 在失败**之前**已经把旧的包目录改名为 `~ssh_mcp`，于是环境变成
+   "没有可导入的 `ssh_mcp`" —— 原本能用的命令反而坏了。
+2. **非 editable 安装会遮蔽 `src/`。** `site-packages/ssh_mcp` 在 `sys.path` 里优先于 `.pth`，
+   测试会在你毫无察觉的情况下对着旧代码通过。
+
+`scripts/dev.py` 的做法是**不生成 console script**：往 venv 写一个 `_ssh_mcp_dev.pth` 指向 `src/`，
+直接用 `python -m ssh_mcp` 运行。没有 exe 就没有锁，改完代码即时生效。`doctor` 和 `test`
+都会在不注入 `PYTHONPATH` 的前提下检查 `import ssh_mcp` 落在哪里，确保校验的是真实状态。
+
+### 测试
+
+```bash
+make test                                  # 等价于 python scripts/dev.py test
+python scripts/dev.py test -q -k sftp      # 透传 pytest 参数
+SSH_MCP_RUN_LARGE=1 python scripts/dev.py test -m large -q   # 1 GB 内存基线
 ```
 
 ## 已知取舍
