@@ -121,6 +121,23 @@ python scripts/install.py --mcp-key mcp_xxx --skip-install
 claude mcp add -s user ssh -e MCP_KEY=mcp_xxx -e SSH_MCP_ALLOWED_LOCAL_ROOTS=~/ssh-mcp-files -- ssh-mcp --transport stdio
 ```
 
+## 更新已安装的机器
+
+包版本号在两次提交之间不变，所以普通 `pip install` 会把现有安装视为已满足并**跳过**。更新必须显式强制：
+
+```bash
+python scripts/install.py --mcp-key mcp_xxx --update
+```
+
+`--update` 会 `--force-reinstall --no-deps` 重装当前提交的代码，然后照常重写客户端配置。只想重装包、不动配置时：
+
+```bash
+pip install --force-reinstall --no-deps "git+https://github.com/ashu1800/ssh-mcp.git"
+```
+
+已用 venv 安装的机器（`install.py` 默认），更新也会装回同一个 venv；用 `pip install --user` 装的机器用上面的 pip 命令即可。
+更新后需要重启客户端（Desktop/Cursor 重启应用，Claude Code 新开会话）才会加载新进程。
+
 ## 客户端配置
 
 `command` 必须是**绝对路径或 PATH 中的可执行文件名**——MCP 客户端不会继承你终端里的虚拟环境激活状态。
