@@ -169,6 +169,14 @@ pip install --force-reinstall --no-deps "git+https://github.com/ashu1800/ssh-mcp
 已用 venv 安装的机器（`install.py` 默认），更新也会装回同一个 venv；用 `pip install --user` 装的机器用上面的 pip 命令即可。
 更新后需要重启客户端（Desktop/Cursor 重启应用，Claude Code 新开会话）才会加载新进程。
 
+### 客户端正在运行时更新
+
+Windows 不允许替换正在运行的 `ssh-mcp.exe`，而 MCP 客户端会把它一直启动着，所以更新时 pip 必然报
+`[WinError 32] 另一个程序正在使用此文件`。这**不是**安装失败：脚本会自动重新装好包本体，只把
+启动器换成 `python -m ssh_mcp` 写进客户端配置，功能完全等价，不关客户端也能完成更新。
+
+要彻底刷新启动器本身，先退出启动了 ssh-mcp 的客户端（或在其 MCP 设置里停用该服务器）再跑一次即可。
+
 ## 客户端配置
 
 `command` 必须是**绝对路径或 PATH 中的可执行文件名**——MCP 客户端不会继承你终端里的虚拟环境激活状态。

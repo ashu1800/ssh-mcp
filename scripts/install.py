@@ -65,6 +65,127 @@ def _venv_python(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+# An MCP client starts ``ssh-mcp.exe`` and keeps it running, and Windows will not
+# let pip replace a running launcher: the rename to ``.deleteme`` fails with
+# WinError 32. What matters is that the importable package still gets installed,
+# because ``python -m ssh_mcp`` runs it without going through the launcher.
+_IN_USE_MARKERS = (
+    "winerror 32",
+    "winerror 5",
+    "另一个程序正在使用此文件",
+    "being used by another process",
+    "process cannot access the file",
+)
+
+
+def _pip_install(pip_args: list[str], requirement: str, *, scripts_dir: Path | None) -> str:
+    """Run pip and return ``"ok"``, ``"script_locked"`` or raise.
+
+    ``script_locked`` means the package was installed but the launcher could not
+    be replaced because a client is running it. That is a warning, not a
+    failure: the caller switches to ``python -m ssh_mcp`` for that environment.
+    """
+    proc = subprocess.run([*pip_args, requirement], capture_output=True, text=True)
+    output = f"{proc.stdout or ''}{proc.stderr or ''}"
+    if proc.returncode == 0:
+        _clean_invalid_dists(scripts_dir)
+        return "ok"
+    if not any(marker in output.lower() for marker in _IN_USE_MARKERS):
+        raise SystemExit(output.strip() or f"pip failed with exit status {proc.returncode}")
+
+    # A locked launcher aborts pip *after* it has already renamed the old
+    # package directory aside (``ssh_mcp`` -> ``~sh_mcp``), which leaves the
+    # environment with no importable package at all -- the worst outcome, since
+    # the command that was working before now fails. An uninstall gets the
+    # rename done and fails on the same launcher, so a plain reinstall after it
+    # succeeds; the launcher is the only thing that stays stale.
+    _pip_uninstall(pip_args, scripts_dir)
+    retry = subprocess.run([*pip_args, requirement], capture_output=True, text=True)
+    if retry.returncode == 0:
+        _clean_invalid_dists(scripts_dir)
+        print("  ssh-mcp.exe is running, so its launcher could not be replaced.")
+        print("  The package itself was updated; clients will use python -m ssh_mcp.")
+        return "script_locked"
+
+    if _package_is_installed(scripts_dir):
+        _clean_invalid_dists(scripts_dir)
+        print("  ssh-mcp.exe is running, so its launcher could not be replaced.")
+        print("  The package itself was updated; clients will use python -m ssh_mcp.")
+        return "script_locked"
+
+    raise SystemExit(f"{retry.stdout or ''}{retry.stderr or ''}".strip() + "\n\n" + _close_clients_hint())
+
+
+def _pip_uninstall(pip_args: list[str], scripts_dir: Path | None) -> None:
+    """Remove the installed package, tolerating a locked console script.
+
+    pip renames the package directory before it touches ``Scripts/``, so a
+    failure there still leaves the old package out of the way -- which is
+    exactly what the following install needs.
+    """
+    python = str(scripts_dir.parent / ("Scripts/python.exe" if os.name == "nt" else "bin/python")) if scripts_dir else sys.executable
+    subprocess.run([python, "-m", "pip", "uninstall", "-y", "ssh-mcp"], capture_output=True, text=True)
+
+
+def _package_is_installed(scripts_dir: Path | None) -> bool:
+    """Whether ``ssh_mcp`` can be imported by the environment pip targeted."""
+    if scripts_dir is None:
+        return True
+    python = scripts_dir.parent / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    python = python if python.is_file() else Path(sys.executable)
+    proc = subprocess.run([str(python), "-c", "import ssh_mcp"], capture_output=True, text=True)
+    return proc.returncode == 0
+
+
+def _clean_invalid_dists(scripts_dir: Path | None) -> None:
+    """Remove the ``~name`` directories pip leaves after a failed uninstall.
+
+    They make every later pip run print ``Ignoring invalid distribution``. The
+    new package directory is written before the old one is renamed away, so
+    these hold nothing the environment still imports.
+    """
+    if scripts_dir is None:
+        return
+    site_packages = scripts_dir.parent / ("Lib/site-packages" if os.name == "nt" else "lib/python3/site-packages")
+    if not site_packages.is_dir():
+        return
+    for entry in site_packages.iterdir():
+        if entry.name.startswith("~") and (entry.is_dir() or entry.name.endswith(".dist-info")):
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+
+
+def _running_ssh_mcp() -> list[str]:
+    """Whether a client currently has ssh-mcp running."""
+    if os.name != "nt":
+        return []
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq ssh-mcp.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line for line in proc.stdout.splitlines() if line.lower().startswith('"ssh-mcp.exe"')]
+
+
+def _close_clients_hint() -> str:
+    """What to tell the user when even the package could not be replaced."""
+    if _running_ssh_mcp():
+        return (
+            "ssh-mcp is running right now. Quit the MCP client that started it (Claude Code, DSH, "
+            "Cursor, ...) -- or stop the server from its MCP settings -- and run this again."
+        )
+    return (
+        "A process is holding ssh-mcp's files. Quit every MCP client that has this server enabled "
+        "and run this again."
+    )
+
+
 def install_package(args: argparse.Namespace, repo: Path) -> tuple[str, str]:
     """Install ssh-mcp and return (command, source)."""
     if args.skip_install:
@@ -113,13 +234,18 @@ def install_package(args: argparse.Namespace, repo: Path) -> tuple[str, str]:
         # ``--update`` mean "take the current content of the requirement".
         pip_args += ["--force-reinstall", "--no-deps"]
     print(f"{'updating' if args.update else 'installing'} {requirement} ...")
-    subprocess.run([*pip_args, requirement], check=True)
+    scripts_dir = Path(args.venv).expanduser() / ("Scripts" if os.name == "nt" else "bin") if args.venv else None
+    outcome = _pip_install(pip_args, requirement, scripts_dir=scripts_dir)
 
     # Prefer the console script: it pins the interpreter that actually has the
     # package, whereas a bare ``python`` may resolve to a different one later.
+    # When the launcher is locked by a running client it is stale, so point the
+    # config at the interpreter instead -- that always runs the fresh code.
     if args.venv:
         script = Path(args.venv).expanduser() / ("Scripts/ssh-mcp.exe" if os.name == "nt" else "bin/ssh-mcp")
-        command = str(script) if script.is_file() else target
+        command = str(script) if script.is_file() and outcome != "script_locked" else target
+    elif outcome == "script_locked":
+        command = target
     else:
         # ``pip install --user`` puts the script outside the interpreter's own
         # bin dir, so ask pip where it landed before falling back to PATH.

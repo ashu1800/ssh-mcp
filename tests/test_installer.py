@@ -168,3 +168,84 @@ def test_dsh_writer_quotes_values_yaml_would_misread(installer):
     assert installer._yaml_scalar("null") == '"null"'
     assert installer._yaml_scalar("-x") == "-x"
     assert installer._yaml_scalar("- x") == '"- x"'
+
+
+# -- pip recovery from a locked launcher --------------------------------------
+#
+# A client that started ``ssh-mcp.exe`` keeps Windows from replacing it, and pip
+# aborts mid-install. The installer must end with an importable package rather
+# than leave the environment without one.
+
+import subprocess as _subprocess  # noqa: E402
+
+
+class _FakePip:
+    """Records the pip invocations the installer makes and replays outcomes."""
+
+    def __init__(self, installer, monkeypatch, results: list[tuple[int, str]]):
+        self.calls: list[list[str]] = []
+        self._results = list(results)
+        monkeypatch.setattr(installer.subprocess, "run", self)
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(list(cmd))
+        if "uninstall" in cmd:
+            # The uninstall always dies on the locked launcher; that is fine,
+            # because it has already moved the old package directory aside.
+            return _subprocess.CompletedProcess(cmd, 2, "", "PermissionError: [WinError 32]")
+        code, text = self._results.pop(0) if self._results else (0, "")
+        return _subprocess.CompletedProcess(cmd, code, text if code else text, text if code else "")
+
+
+def test_pip_retries_after_uninstalling_when_the_launcher_is_locked(installer, monkeypatch, tmp_path):
+    lock = (
+        "ERROR: Could not install packages due to an OSError: [WinError 32] "
+        "The process cannot access the file because it is being used by another process: "
+        "'c:\\x\\.venv\\scripts\\ssh-mcp.exe'"
+    )
+    fake = _FakePip(installer, monkeypatch, results=[(1, lock), (0, "")])
+    monkeypatch.setattr(installer, "_package_is_installed", lambda scripts_dir: True)
+    monkeypatch.setattr(installer, "_clean_invalid_dists", lambda scripts_dir: None)
+
+    outcome = installer._pip_install(["python", "-m", "pip", "install"], "req", scripts_dir=tmp_path / "Scripts")
+
+    assert outcome == "script_locked"
+    assert any("uninstall" in call for call in fake.calls), "the old package must be removed before retrying"
+    assert sum(1 for call in fake.calls if "install" in call) == 2
+
+
+def test_pip_failure_unrelated_to_a_lock_is_reported_as_is(installer, monkeypatch, tmp_path):
+    fake = _FakePip(installer, monkeypatch, results=[(1, "ERROR: No matching distribution found for ssh-mcp")])
+    with pytest.raises(SystemExit) as excinfo:
+        installer._pip_install(["python", "-m", "pip", "install"], "req", scripts_dir=tmp_path / "Scripts")
+    assert "No matching distribution" in str(excinfo.value)
+    assert not any("uninstall" in call for call in fake.calls)
+
+
+def test_pip_gives_up_with_client_hint_when_the_package_is_still_missing(installer, monkeypatch, tmp_path):
+    lock = "WinError 32: the process cannot access the file 'ssh-mcp.exe'"
+    monkeypatch.setattr(installer, "_package_is_installed", lambda scripts_dir: False)
+    monkeypatch.setattr(installer, "_running_ssh_mcp", lambda: ['"ssh-mcp.exe","1"'])
+    _FakePip(installer, monkeypatch, results=[(1, lock), (1, lock)])
+
+    with pytest.raises(SystemExit) as excinfo:
+        installer._pip_install(["python", "-m", "pip", "install"], "req", scripts_dir=tmp_path / "Scripts")
+    assert "running right now" in str(excinfo.value)
+
+
+def test_install_package_uses_the_interpreter_when_the_launcher_is_locked(installer, monkeypatch, tmp_path):
+    """The stale launcher must not end up in the client config."""
+    venv = tmp_path / "venv"
+    scripts = venv / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "python.exe").write_bytes(b"")
+    (scripts / "ssh-mcp.exe").write_bytes(b"MZ stale")
+    monkeypatch.setattr(installer.os, "name", "nt")
+    monkeypatch.setattr(installer, "_pip_install", lambda *a, **k: "script_locked")
+
+    args = installer.parse_args(["--mcp-key", "mcp_x", "--venv", str(venv)])
+    command, _ = installer.install_package(args, tmp_path)
+
+    assert command == str(scripts / "python.exe")
+    assert not command.endswith("ssh-mcp.exe")
+    assert installer.launch_argv(command) == [command, "-m", "ssh_mcp", "--transport", "stdio"]
