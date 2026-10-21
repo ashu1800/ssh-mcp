@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssh-mcp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local MCP server exposing SSH command execution and SFTP transfers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,9 @@ dev = [
     "pytest-asyncio>=0.24",
     "psutil>=6",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "ssh_mcp.__version__"}
 
 [project.scripts]
 ssh-mcp = "ssh_mcp.__main__:main"

@@ -68,6 +68,8 @@ def install_package(args: argparse.Namespace, repo: Path) -> tuple[str, str]:
     if args.skip_install:
         if args.from_wheel:
             raise SystemExit("--skip-install cannot be combined with --from-wheel")
+        if args.update:
+            raise SystemExit("--update installs the package; it cannot be combined with --skip-install")
         existing = shutil.which("ssh-mcp") or _console_script_via_pip([sys.executable, "-m", "pip"])
         if existing:
             return existing, "existing ssh-mcp installation"
@@ -102,8 +104,14 @@ def install_package(args: argparse.Namespace, repo: Path) -> tuple[str, str]:
         requirement = args.package
     else:
         requirement = str(repo)
-    print(f"installing {requirement} ...")
-    subprocess.run([*pip_cmd, "--quiet", requirement], check=True)
+    pip_args = [*pip_cmd, "--quiet"]
+    if args.update:
+        # The version number does not change between commits, so pip treats an
+        # existing install as satisfied and skips it. --force-reinstall makes
+        # ``--update`` mean "take the current content of the requirement".
+        pip_args += ["--force-reinstall", "--no-deps"]
+    print(f"{'updating' if args.update else 'installing'} {requirement} ...")
+    subprocess.run([*pip_args, requirement], check=True)
 
     # Prefer the console script: it pins the interpreter that actually has the
     # package, whereas a bare ``python`` may resolve to a different one later.
@@ -386,6 +394,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated subset of: claude,cursor,vscode,desktop,all (default: all)",
     )
     parser.add_argument("--skip-install", action="store_true", help="only write client configs")
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="reinstall an existing installation (needed because the version does not change between commits)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="report actions without changing anything")
     return parser.parse_args(argv)
 

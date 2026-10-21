@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from mcp.server import MCPServer
 
+from ssh_mcp import __version__
 from ssh_mcp.config import Settings
 from ssh_mcp.credentials.client import CredentialClient
 from ssh_mcp.ssh.auth_state import AuthStateStore
@@ -83,7 +84,7 @@ def create_server(settings: Settings, *, state: AppState | None = None) -> MCPSe
     app = MCPServer(
         name="ssh-mcp",
         title="SSH / SFTP",
-        version="0.1.0",
+        version=__version__,
         instructions=(
             "通过服务器管理服务下发的加密凭据，对远端主机执行非交互式 SSH 命令并进行 SFTP 文件传输。"
             "典型流程：list_servers 找到 server_id → resolve_server 确认目标 → connect 拿到 connection_handle → "
