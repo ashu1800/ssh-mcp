@@ -35,7 +35,7 @@ def _make_state(settings, fake_service):
         AuthStateStore(settings.auth_state_path),
         KeyStore(settings.keys_dir),
     )
-    pool = ConnectionPool(settings, connector)
+    pool = ConnectionPool(settings, connector, credentials)
     return AppState(settings=settings, credentials=credentials, pool=pool)
 
 

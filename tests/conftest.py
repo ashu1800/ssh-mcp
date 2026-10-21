@@ -86,13 +86,31 @@ async def connector(settings: Settings):
     return Connector(settings, known_hosts, auth_state, key_store)
 
 
+class _StaticCredentials:
+    """Stands in for the credential service: always returns the same payload.
+
+    Only the reconnect path uses it, and the tests that exercise reconnection
+    hand the pool a payload through ``connect`` first anyway.
+    """
+
+    def __init__(self) -> None:
+        self.payload = None
+        self.calls = 0
+
+    async def get_credential(self, server_id: str, *, refresh: bool = False):
+        self.calls += 1
+        if self.payload is None:
+            raise AssertionError("test did not seed a credential payload")
+        return self.payload
+
+
 @pytest_asyncio.fixture
 async def pool(settings: Settings):
     known_hosts = KnownHostsStore(settings.known_hosts_path)
     auth_state = AuthStateStore(settings.auth_state_path)
     key_store = KeyStore(settings.keys_dir)
     connector = Connector(settings, known_hosts, auth_state, key_store)
-    instance = ConnectionPool(settings, connector)
+    instance = ConnectionPool(settings, connector, _StaticCredentials())
     instance.start_reaper()
     try:
         yield instance

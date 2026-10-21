@@ -43,16 +43,18 @@ class AppState:
 
 
 def build_state(settings: Settings) -> AppState:
-    state = AppState(settings=settings, credentials=CredentialClient(settings), pool=_build_pool(settings))
-    return state
+    credentials = CredentialClient(settings)
+    return AppState(settings=settings, credentials=credentials, pool=_build_pool(settings, credentials))
 
 
-def _build_pool(settings: Settings) -> ConnectionPool:
+def _build_pool(settings: Settings, credentials: CredentialClient | None = None) -> ConnectionPool:
     known_hosts = KnownHostsStore(settings.known_hosts_path)  # type: ignore[arg-type]
     auth_state = AuthStateStore(settings.auth_state_path)  # type: ignore[arg-type]
     key_store = KeyStore(settings.keys_dir)  # type: ignore[arg-type]
     connector = Connector(settings, known_hosts, auth_state, key_store)
-    return ConnectionPool(settings, connector)
+    # The pool needs the credential client so it can refetch a credential when
+    # rebuilding a connection whose socket died.
+    return ConnectionPool(settings, connector, credentials)
 
 
 def create_server(settings: Settings, *, state: AppState | None = None) -> MCPServer:

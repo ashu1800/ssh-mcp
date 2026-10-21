@@ -170,7 +170,13 @@ async def test_disconnect_closes_and_forgets(pool, credential_payload):
 
 
 @pytest.mark.asyncio
-async def test_reaper_evicts_idle_entries(pool, credential_payload, settings):
+async def test_reaper_closes_the_socket_but_keeps_the_handle(pool, credential_payload, settings):
+    """Idle reaping frees the connection, not the handle the caller is holding.
+
+    Dropping the handle turned "you were idle for five minutes" into
+    "connection_not_found" for every client still holding the value.
+    """
+    pool._credentials.payload = credential_payload
     entry = await pool.connect(credential_payload)
     conn = entry.conn
     settings.pool_idle_timeout = 0.01
@@ -178,7 +184,11 @@ async def test_reaper_evicts_idle_entries(pool, credential_payload, settings):
     closed = await pool.reap_once()
     assert closed == [credential_payload.key]
     assert conn is not None and conn.is_closed()
-    assert pool.stats()["count"] == 0
+    # The entry survives, so the handle still resolves.
+    assert pool.stats()["count"] == 1
+    acquired = await pool.acquire(entry.handle)
+    assert acquired.conn is not None and not acquired.conn.is_closed()
+    pool.release(acquired.entry)
 
 
 @pytest.mark.asyncio
@@ -194,31 +204,62 @@ async def test_reaper_skips_busy_entries(pool, credential_payload, settings):
 
 
 @pytest.mark.asyncio
-async def test_dead_connection_is_rebuilt(pool, credential_payload):
+async def test_dead_connection_is_rebuilt_and_keeps_its_handle(pool, credential_payload):
+    """A lost socket must not invalidate the handle a client is holding."""
+    pool._credentials.payload = credential_payload
     entry = await pool.connect(credential_payload)
-    old_handle = entry.handle
+    handle = entry.handle
     entry.conn.close()
     await entry.conn.wait_closed()
-    rebuilt = await pool.connect(credential_payload)
-    assert rebuilt.conn is not None and not rebuilt.conn.is_closed()
-    assert rebuilt.handle != old_handle
-    with pytest.raises(ToolFailure):
-        await pool.acquire(old_handle)
+
+    acquired = await pool.acquire(handle)
+    assert acquired.conn is not None and not acquired.conn.is_closed()
+    pool.release(acquired.entry)
+    # Same handle, transparently reconnected.
+    assert entry.handle == handle
+    assert pool.stats()["counters"].get("connections_reestablished") == 1
 
 
 @pytest.mark.asyncio
-async def test_stale_handle_cannot_disconnect_the_rebuilt_connection(pool, credential_payload):
+async def test_reconnect_refetches_the_credential(pool, credential_payload, monkeypatch):
+    """The password may have rotated while the connection was down."""
+    pool._credentials.payload = credential_payload
+    entry = await pool.connect(credential_payload)
+    entry.conn.close()
+    await entry.conn.wait_closed()
+
+    seen: list[str] = []
+    original = pool._connector.connect
+
+    async def spy(payload, **kwargs):
+        seen.append(payload.server_id)
+        return await original(payload, **kwargs)
+
+    monkeypatch.setattr(pool._connector, "connect", spy)
+    acquired = await pool.acquire(entry.handle)
+    pool.release(acquired.entry)
+    assert seen, "reconnect must go through the connector"
+
+
+@pytest.mark.asyncio
+async def test_force_new_replaces_the_socket_without_invalidating_the_handle(pool, credential_payload):
+    """`connect` may rebuild, but the handle a caller already has stays valid.
+
+    Rotating it meant every reconnection silently broke any client that had
+    cached the old value -- which is exactly the "connection_not_found" users
+    were hitting.
+    """
     first = await pool.connect(credential_payload)
-    stale_handle = first.handle
+    handle = first.handle
+    old_conn = first.conn
     rebuilt = await pool.connect(credential_payload, force_new=True)
-    assert rebuilt.handle != stale_handle
 
-    with pytest.raises(ToolFailure) as excinfo:
-        await pool.disconnect(stale_handle)
-
-    assert excinfo.value.error == "connection_not_found"
-    assert rebuilt.conn is not None and not rebuilt.conn.is_closed()
-    await pool.acquire(rebuilt.handle)  # still usable
+    assert rebuilt.handle == handle
+    assert rebuilt.conn is not old_conn
+    # Both the old value and the new one address the same, working connection.
+    acquired = await pool.acquire(handle)
+    assert acquired.conn is not None and not acquired.conn.is_closed()
+    pool.release(acquired.entry)
 
 
 @pytest.mark.asyncio

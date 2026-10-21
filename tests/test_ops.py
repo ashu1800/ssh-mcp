@@ -32,7 +32,7 @@ def app(settings, fake_service, ssh_server):
         AuthStateStore(settings.auth_state_path),
         KeyStore(settings.keys_dir),
     )
-    pool = ConnectionPool(settings, connector)
+    pool = ConnectionPool(settings, connector, credentials)
     pool.start_reaper()
     return create_server(settings, state=AppState(settings=settings, credentials=credentials, pool=pool))
 

@@ -28,7 +28,7 @@ def app(settings, fake_service, ssh_server):
         AuthStateStore(settings.auth_state_path),
         KeyStore(settings.keys_dir),
     )
-    pool = ConnectionPool(settings, connector)
+    pool = ConnectionPool(settings, connector, credentials)
     pool.start_reaper()
     state = AppState(settings=settings, credentials=credentials, pool=pool)
     return create_server(settings, state=state)
@@ -418,3 +418,29 @@ async def test_connection_stats_reports_the_pool(app):
     assert payload["counters"]["connections_established"] >= 1
     entry = payload["entries"][0]
     assert set(entry) >= {"host", "port", "username", "alive", "in_flight"}
+
+
+@pytest.mark.asyncio
+async def test_handle_survives_idle_reaping(app, settings):
+    """The reported bug: an idle-pooled connection must not invalidate the handle.
+
+    Reaping closes the socket after `pool_idle_timeout`; before this, it also
+    dropped the mapping, so every later call with the handle the model was
+    holding failed with `connection_not_found`.
+    """
+    connect_payload, _ = await call(app, "connect", server_id="1")
+    handle = connect_payload["connection_handle"]
+
+    # Force the reaper to consider the entry idle, then run it.
+    settings.pool_idle_timeout = 0.01
+    import asyncio
+
+    await asyncio.sleep(0.05)
+    pool = app._ssh_mcp_state.pool
+    closed = await pool.reap_once()
+    assert len(closed) == 1
+    assert pool.stats()["count"] == 1  # entry kept, socket closed
+
+    # The same handle still works: transparently reconnected.
+    payload, is_error = await call(app, "get_system_overview", connection_handle=handle)
+    assert payload.get("error") != "connection_not_found"

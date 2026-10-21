@@ -18,12 +18,16 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import asyncssh
 
 from ssh_mcp.config import Settings
 from ssh_mcp.errors import ConnectionMissing, ToolFailure
 from ssh_mcp.models import CredentialPayload
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ssh_mcp.credentials.client import CredentialClient
 from ssh_mcp.ssh.connector import ConnectFailure, ConnectResult, Connector
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,9 @@ class PoolEntry:
     warning: str | None = None
     in_flight: int = 0
     last_used: float = field(default_factory=time.monotonic)
+    # Set when the socket is gone but the handle is kept alive so a caller
+    # holding it can reconnect instead of seeing "connection_not_found".
+    closed_at: float | None = None
 
     @property
     def host(self) -> str:
@@ -78,9 +85,17 @@ class Acquired:
 class ConnectionPool:
     """Pool of live SSH connections keyed by (host, port, username)."""
 
-    def __init__(self, settings: Settings, connector: Connector) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        connector: Connector,
+        credentials: "CredentialClient | None" = None,
+    ) -> None:
         self._settings = settings
         self._connector = connector
+        # Used only to refetch a credential when a dead connection is rebuilt;
+        # without it a lost socket means a lost handle.
+        self._credentials = credentials
         self._entries: dict[tuple[str, int, str], PoolEntry] = {}
         self._by_handle: dict[str, tuple[str, int, str]] = {}
         self._map_lock = asyncio.Lock()
@@ -154,7 +169,16 @@ class ConnectionPool:
                 logger.exception("connection pool reaper failed")
 
     async def reap_once(self) -> list[tuple[str, int, str]]:
-        """Close idle entries; returns the keys that were closed."""
+        """Close idle connections, keeping their handles usable.
+
+        The socket is released but the entry (and therefore the handle the
+        client is holding) stays behind: an idle timeout means "stop using
+        resources", not "invalidate every handle the model was given". The
+        next call through that handle reconnects transparently.
+
+        Entries are dropped entirely once they have been idle-and-closed for
+        ``pool_handle_ttl`` seconds, so handles cannot accumulate forever.
+        """
         if self._settings.pool_idle_timeout <= 0:
             return []
         now = time.monotonic()
@@ -163,19 +187,47 @@ class ConnectionPool:
             candidates = [
                 entry
                 for entry in self._entries.values()
-                if entry.in_flight == 0 and (now - entry.last_used) >= self._settings.pool_idle_timeout
+                if entry.is_alive()
+                and entry.in_flight == 0
+                and (now - entry.last_used) >= self._settings.pool_idle_timeout
             ]
         for entry in candidates:
             async with entry.lock:
                 if entry.in_flight != 0 or (time.monotonic() - entry.last_used) < self._settings.pool_idle_timeout:
                     continue
-                async with self._map_lock:
-                    self._entries.pop(entry.key, None)
-                    self._by_handle.pop(entry.handle, None)
                 await self._close_entry(entry)
+                entry.closed_at = time.monotonic()
                 closed.append(entry.key)
-                logger.info("closed idle SSH connection to %s@%s:%s", entry.username, entry.host, entry.port)
+                logger.info(
+                    "closed idle SSH connection to %s@%s:%s (handle stays valid)",
+                    entry.username,
+                    entry.host,
+                    entry.port,
+                )
+        await self._expire_old_handles(now)
         return closed
+
+    async def _expire_old_handles(self, now: float) -> int:
+        """Drop handles that have been closed for longer than ``pool_handle_ttl``."""
+        ttl = self._settings.pool_handle_ttl
+        if ttl <= 0:
+            return 0
+        expired = 0
+        async with self._map_lock:
+            for key in list(self._entries):
+                entry = self._entries[key]
+                if entry.closed_at is None or entry.in_flight != 0:
+                    continue
+                if (now - entry.closed_at) < ttl:
+                    continue
+                self._entries.pop(key, None)
+                self._by_handle.pop(entry.handle, None)
+                if self._default_handle == entry.handle:
+                    self._default_handle = None
+                expired += 1
+        if expired:
+            logger.info("expired %d stale connection handle(s)", expired)
+        return expired
 
     # -- public API -----------------------------------------------------------
 
@@ -225,14 +277,13 @@ class ConnectionPool:
             entry.compression = result.compression
             entry.warning = result.warning
             entry.sftp = None
-            previous_handle = entry.handle
-            entry.handle = secrets.token_urlsafe(18)
+            entry.closed_at = None
+            # The handle is deliberately *not* rotated. A client that was given
+            # this handle keeps it across reconnects; rotating it turned every
+            # transient disconnect into "connection_not_found" for code that
+            # was still holding the old value.
             entry.touch()
             async with self._map_lock:
-                # Retire the old handle: it must not resolve to the rebuilt
-                # connection, or a stale handle could disconnect a live entry.
-                if previous_handle != entry.handle:
-                    self._by_handle.pop(previous_handle, None)
                 self._by_handle[entry.handle] = key
             self._default_handle = entry.handle
             return entry
@@ -243,6 +294,11 @@ class ConnectionPool:
         ``None`` means "the connection this client used last". That is only
         unambiguous on a single-user transport; the HTTP transport passes an
         explicit handle on every call.
+
+        A handle whose socket has gone away is reconnected rather than
+        rejected: idle reaping, a network blip and a server restart all look
+        the same to the caller, and none of them should invalidate the handle
+        the model is holding.
         """
         if handle is None:
             handle = self._default_handle
@@ -252,15 +308,64 @@ class ConnectionPool:
         if key is None:
             raise ConnectionMissing(handle)
         entry = self._entries.get(key)
-        if entry is None or entry.handle != handle or not entry.is_alive():
+        if entry is None or entry.handle != handle:
             if self._default_handle == handle:
                 self._default_handle = None
             raise ConnectionMissing(handle)
+
+        if not entry.is_alive():
+            await self._reconnect(entry)
+
         entry.in_flight += 1
         entry.touch()
         self._default_handle = handle
         assert entry.conn is not None
         return Acquired(entry=entry, conn=entry.conn, _pool=self)
+
+    async def _reconnect(self, entry: PoolEntry) -> None:
+        """Rebuild a dead entry in place, keeping its handle.
+
+        The credential may have rotated since the connection was made, so it is
+        fetched again (subject to the credential client's own short TTL cache)
+        rather than reusing whatever the entry was built from.
+        """
+        if self._credentials is None or entry.server_id is None:
+            raise ConnectionMissing(entry.handle)
+        async with entry.lock:
+            if entry.is_alive():
+                return  # another caller won the race
+            try:
+                payload = await self._credentials.get_credential(str(entry.server_id))
+            except ToolFailure:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise ToolFailure(
+                    "connection_lost",
+                    stage="reconnect",
+                    hint=f"连接已断开，重新获取凭据失败（{type(exc).__name__}）。请调用 connect 重试。",
+                    retryable=True,
+                    connection_handle=entry.handle,
+                ) from None
+            try:
+                result = await self._connector.connect(payload)
+            except ConnectFailure as exc:
+                raise ToolFailure(
+                    exc.error,
+                    stage=exc.stage,
+                    hint=f"连接已断开，自动重连失败：{exc.hint}",
+                    retryable=exc.retryable,
+                    connection_handle=entry.handle,
+                    **{k: v for k, v in exc.details.items() if k not in {"stage"}},
+                ) from None
+            self.record("connections_reestablished")
+            entry.conn = result.conn
+            entry.auth_method = result.auth_method
+            entry.compression = result.compression
+            entry.warning = result.warning
+            entry.sftp = None
+            entry.closed_at = None
+            entry.touch()
+            logger.info("reconnected to %s@%s:%s", entry.username, entry.host, entry.port)
 
     def set_default(self, handle: str) -> None:
         """Remember ``handle`` as the implicit target for later calls."""

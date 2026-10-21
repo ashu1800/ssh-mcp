@@ -138,6 +138,8 @@ class Settings:
     pool_idle_timeout: float = 300.0
     pool_reaper_interval: float = 60.0
     pool_max_entries: int = 64
+    # How long a closed-but-remembered handle stays valid for reconnection.
+    pool_handle_ttl: float = 3600.0
     compression_mode: str = "auto"  # auto | on | off
 
     # --- commands ------------------------------------------------------------
@@ -333,6 +335,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         pool_reaper_interval=src.number("SSH_MCP_POOL_REAPER_INTERVAL", "pool_reaper_interval", 60.0, minimum=1.0),
         # Ceiling on live SSH connections; idle LRU entries are evicted first.
         pool_max_entries=src.integer("SSH_MCP_POOL_MAX_ENTRIES", "pool_max_entries", 64, minimum=1),
+        pool_handle_ttl=src.number("SSH_MCP_POOL_HANDLE_TTL", "pool_handle_ttl", 3600.0, minimum=0.0),
         compression_mode=compression_mode,
         command_timeout_default=src.number("SSH_MCP_COMMAND_TIMEOUT_DEFAULT", "command_timeout_default", 30.0, minimum=1.0),
         command_timeout_max=src.number("SSH_MCP_COMMAND_TIMEOUT_MAX", "command_timeout_max", 600.0, minimum=1.0),

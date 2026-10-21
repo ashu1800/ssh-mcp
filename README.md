@@ -67,6 +67,8 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 | `SSH_MCP_ALLOWED_LOCAL_ROOTS` | 空（不限制） | 可选。设置后本地**读写**都只允许这些目录（`os.pathsep` 分隔，realpath 校验，symlink 解析后判断） |
 | `SSH_MCP_WRITE_LOCAL_ROOTS` | 空（不限制） | 可选。只限制**写入**（下载落盘）的目录，读取不受影响 —— 推荐用它代替上面那条，既能读构建产物又不会污染其它目录 |
 | `SSH_MCP_POOL_MAX_ENTRIES` | 64 | 同时保持的 SSH 连接上限，超限时淘汰最久未用的空闲连接 |
+| `SSH_MCP_POOL_IDLE_TIMEOUT` | 300 | 空闲多少秒后关闭 socket（**handle 仍然有效**，下次调用自动重连） |
+| `SSH_MCP_POOL_HANDLE_TTL` | 3600 | 连接关闭后 handle 再保留多久；超时才彻底失效 |
 | `SSH_MCP_STATE_DIR` | `~/.ssh-mcp` | known_hosts、Ed25519 私钥、认证状态 |
 | `SSH_MCP_SFTP_BLOCK_SIZE` | 256 KiB | SFTP 请求流水线块大小 |
 | `SSH_MCP_SFTP_IDLE_TIMEOUT` | 60 s | 连续无数据即中止（大文件主超时） |
@@ -273,7 +275,7 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 | `list_servers` | 列出可访问服务器（无凭据） | – |
 | `resolve_server` | 返回脱敏连接摘要 | – |
 | `connect` | 建立/复用连接，返回 `connection_handle` | – |
-| `disconnect` | 关闭连接 | ✓ |
+| `disconnect` | 关闭连接（handle 随之失效） | ✓ |
 | `execute_command` | 执行非交互命令，超时终止远端进程 | – |
 | `upload_file` / `download_file` | 单文件传输 | 覆盖时 ✓ |
 | `upload_files` / `download_files` | 批量传输（并发限流） | 覆盖时 ✓ |
@@ -298,6 +300,17 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 | `get_system_overview` | 主机名、内核、发行版、uptime、负载、内存、CPU 数 |
 | `list_processes` | 按 CPU/内存排序的进程列表（批处理版 top） |
 | `list_listening_ports` | 监听端口及占用进程 |
+
+### connection_handle 的生命周期
+
+handle 只在两种情况下失效：**显式 `disconnect`**，或关闭后超过 `SSH_MCP_POOL_HANDLE_TTL`（默认 1 小时）。
+
+中途的空闲回收、网络抖动、服务器重启都**不会**让它失效：池子关掉 socket 但保留 handle，
+下次用同一个 handle 调用时会自动重新取凭据并重连（`get_connection_stats` 里的
+`connections_reestablished` 计数会 +1）。重连时凭据会重新拉取，所以改过密码也能恢复。
+
+早先的版本会在回收时连 handle 一起删掉，导致"闲置几分钟后再操作"必定报
+`connection_not_found` —— 那是个缺陷，已修正。
 
 ### 省略 connection_handle
 
