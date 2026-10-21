@@ -99,18 +99,27 @@ python scripts/install.py --mcp-key mcp_xxx
 `--dry-run` 只报告会改哪些文件；`--skip-install` 只写配置；`--clients claude,cursor` 限定目标；
 `--from-wheel dist/xxx.whl` 在离线机器上安装。改动前会留 `.bak`，检测不到客户端的配置不会被创建。
 
-### 无需先 clone 的两条命令
+### 不 clone 仓库的安装方式
+
+私有仓库匿名拉不到原始文件，所以用 pip 直接装（需要本机有 GitHub 凭据，如 `gh auth setup-git`）：
 
 ```bash
 pip install --user "git+https://github.com/ashu1800/ssh-mcp.git"
 ```
 
+装完后再把密钥写进客户端配置，两种办法任选：
+
+**用仓库里的脚本**（需要 checkout，见上一节）：
+
 ```bash
-python -c "import urllib.request,pathlib,subprocess,sys; p=pathlib.Path.home()/'.ssh-mcp-install.py'; p.write_bytes(urllib.request.urlopen('https://raw.githubusercontent.com/ashu1800/ssh-mcp/main/scripts/install.py').read()); sys.exit(subprocess.call([sys.executable,str(p),'--mcp-key','mcp_xxx','--skip-install']))"
+python scripts/install.py --mcp-key mcp_xxx --skip-install
 ```
 
-第一条装包，第二条把密钥写进各客户端配置（`--skip-install` 表示只写配置）。密钥只落在客户端配置文件里，
-不出现在进程列表或日志中；之后可删除 `~/.ssh-mcp-install.py`。
+**用 `claude mcp add`**（只接 Claude Code，不用 checkout）：
+
+```bash
+claude mcp add -s user ssh -e MCP_KEY=mcp_xxx -e SSH_MCP_ALLOWED_LOCAL_ROOTS=~/ssh-mcp-files -- ssh-mcp --transport stdio
+```
 
 ## 客户端配置
 
