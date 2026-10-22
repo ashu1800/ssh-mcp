@@ -96,6 +96,8 @@ class ConnectionPool:
         # Used only to refetch a credential when a dead connection is rebuilt;
         # without it a lost socket means a lost handle.
         self._credentials = credentials
+        # Limits simultaneous SSH handshakes; see max_concurrent_connects.
+        self._connect_gate = asyncio.Semaphore(settings.max_concurrent_connects)
         self._entries: dict[tuple[str, int, str], PoolEntry] = {}
         self._by_handle: dict[str, tuple[str, int, str]] = {}
         self._map_lock = asyncio.Lock()
@@ -256,19 +258,26 @@ class ConnectionPool:
             if entry.is_alive() and force_new:
                 await self._close_entry(entry)
 
-            try:
-                result: ConnectResult = await self._connector.connect(payload, timeout=timeout)
-            except ConnectFailure:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise ToolFailure(
-                    "connect_failed",
-                    stage="connect",
-                    hint=f"建立连接时发生意外错误（{type(exc).__name__}），请重试。",
-                    retryable=True,
-                    host=payload.host,
-                    port=payload.port,
-                ) from None
+            # Gate the handshake itself, not the whole entry lock: a host that
+            # accepts TCP and then stalls would otherwise leave one socket per
+            # attempt, and a retrying client turns that into hundreds of
+            # half-open sessions on the server.
+            async with self._connect_gate:
+                try:
+                    result: ConnectResult = await self._connector.connect(payload, timeout=timeout)
+                except ConnectFailure:
+                    self.record("connect_failures")
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.record("connect_failures")
+                    raise ToolFailure(
+                        "connect_failed",
+                        stage="connect",
+                        hint=f"建立连接时发生意外错误（{type(exc).__name__}），请重试。",
+                        retryable=True,
+                        host=payload.host,
+                        port=payload.port,
+                    ) from None
 
             self.record("connections_established")
             self.record(f"auth_{result.auth_method}")

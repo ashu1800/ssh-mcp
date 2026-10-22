@@ -69,6 +69,7 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 | `SSH_MCP_POOL_MAX_ENTRIES` | 64 | 同时保持的 SSH 连接上限，超限时淘汰最久未用的空闲连接 |
 | `SSH_MCP_POOL_IDLE_TIMEOUT` | 300 | 空闲多少秒后关闭 socket（**handle 仍然有效**，下次调用自动重连） |
 | `SSH_MCP_POOL_HANDLE_TTL` | 3600 | 连接关闭后 handle 再保留多久；超时才彻底失效 |
+| `SSH_MCP_MAX_CONCURRENT_CONNECTS` | 4 | 同时进行的 SSH 握手上限；防止对卡住的主机堆积半开连接 |
 | `SSH_MCP_STATE_DIR` | `~/.ssh-mcp` | known_hosts、Ed25519 私钥、认证状态 |
 | `SSH_MCP_SFTP_BLOCK_SIZE` | 256 KiB | SFTP 请求流水线块大小 |
 | `SSH_MCP_SFTP_IDLE_TIMEOUT` | 60 s | 连续无数据即中止（大文件主超时） |
@@ -300,6 +301,17 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 | `get_system_overview` | 主机名、内核、发行版、uptime、负载、内存、CPU 数 |
 | `list_processes` | 按 CPU/内存排序的进程列表（批处理版 top） |
 | `list_listening_ports` | 监听端口及占用进程 |
+
+### 握手并发上限
+
+`SSH_MCP_MAX_CONCURRENT_CONNECTS`（默认 4）限制**同时进行的 SSH 握手数**。这不是性能参数，是保护措施：
+
+一台接受了 TCP 却不回应握手的机器，每次连接尝试都会在客户端留下一条半开 socket（`FIN_WAIT2`，
+内核持有，用户态关不掉），要等系统超时才回收。客户端在 `retryable: true` 上重试时，这个数量会成倍累积——
+表现就是服务端 `sshd` 进程数暴涨、`who` 显示大量未完成登录。
+
+闸门把并发压在 4，重试再多也只会排队。`get_connection_stats` 的 `counters.connect_failures`
+能看到失败次数，`errors` 里能看出是哪类失败占主导。
 
 ### connection_handle 的生命周期
 

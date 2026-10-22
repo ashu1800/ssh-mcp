@@ -302,3 +302,42 @@ def _ssh_home(settings, connector):
 
     # The fixture creates <tmp>/home; settings.state_dir is <tmp>/state.
     return settings.state_dir.parent / "home"
+
+
+@pytest.mark.asyncio
+async def test_connect_handshakes_are_bounded(pool, settings):
+    """A stalled host must not get one handshake per retrying caller.
+
+    Without the gate, N concurrent connects to a host that accepts TCP and
+    then never answers leave N sockets behind -- and a client retrying on
+    `retryable` multiplies that. The pool caps how many run at once.
+    """
+    import asyncio as _asyncio
+
+    settings.max_concurrent_connects = 2
+    pool._connect_gate = _asyncio.Semaphore(2)
+
+    in_flight = {"now": 0, "peak": 0}
+    original = pool._connector.connect
+
+    async def slow_connect(*args, **kwargs):
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        try:
+            await _asyncio.sleep(0.05)
+            raise AssertionError("expected failure")
+        finally:
+            in_flight["now"] -= 1
+
+    pool._connector.connect = slow_connect
+    from ssh_mcp.models import CredentialPayload
+
+    payloads = [
+        CredentialPayload(server_id=str(i), host="127.0.0.1", port=65000 + i, username=f"u{i}", password="p")
+        for i in range(8)
+    ]
+    await _asyncio.gather(*[pool.connect(p) for p in payloads], return_exceptions=True)
+    pool._connector.connect = original
+
+    assert in_flight["peak"] <= 2
+    assert pool.stats()["counters"]["connect_failures"] == 8
