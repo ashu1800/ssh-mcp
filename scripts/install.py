@@ -336,9 +336,10 @@ class ClientSpec:
     """One MCP client and where it keeps its server list.
 
     ``format`` selects the writer: ``mcp-json`` (``mcpServers`` map),
-    ``vscode-json`` (``servers`` map with a ``type`` field), ``dsh-profile``
-    (the managed block in a DSH profile's ``cordis.patch.yml``) or
-    ``claude-json`` (fallback when the Claude Code CLI is absent).
+    ``vscode-json`` (``servers`` map with a ``type`` field), ``zcode-json``
+    (``mcp.servers`` map with a ``type`` field), ``dsh-profile`` (the managed
+    block in a DSH profile's ``cordis.patch.yml``) or ``claude-json``
+    (fallback when the Claude Code CLI is absent).
     """
 
     label: str
@@ -422,6 +423,27 @@ def _client_specs() -> list[ClientSpec]:
             "mcp-json",
             markers=(home / ".workbuddy",),
             binaries=("workbuddy",),
+        )
+    )
+
+    # ZCode (智谱): the desktop app and the bundled CLI share one config, read
+    # through the path ``mcp.servers``. Its entries are typed the way VS Code
+    # types them (``type: stdio``). The app data root -- not the config file --
+    # is what tells the two builds apart from an unrelated ~/.zcode directory,
+    # and the desktop build creates it only after its first run.
+    zcode_desktop = (
+        appdata / "ZCode"
+        if os.name == "nt"
+        else (app_support / "ZCode" if mac else home / ".config/ZCode")
+    )
+    zcode_markers = (home / ".zcode/cli",) + ((zcode_desktop,) if zcode_desktop.is_dir() else ())
+    specs.append(
+        ClientSpec(
+            "ZCode",
+            home / ".zcode/cli/config.json",
+            "zcode-json",
+            markers=zcode_markers,
+            binaries=("zcode",),
         )
     )
 
@@ -530,6 +552,13 @@ def wire_file(target: ClientTarget, entry: dict[str, Any], *, dry_run: bool) -> 
     if target.kind == "vscode-json":
         # VS Code's schema keys servers under "servers" and requires a type.
         servers = data.setdefault("servers", {})
+        servers[SERVER_NAME] = {"type": "stdio", **entry}
+    elif target.kind == "zcode-json":
+        # Same shape as VS Code's, two levels deeper. The file also holds the
+        # ZCode agent's own settings, so everything outside ``mcp.servers`` is
+        # copied through untouched.
+        mcp = data.setdefault("mcp", {})
+        servers = mcp.setdefault("servers", {})
         servers[SERVER_NAME] = {"type": "stdio", **entry}
     else:
         servers = data.setdefault("mcpServers", {})
@@ -815,7 +844,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="all",
         help=(
             "comma-separated substrings matched against client labels, e.g. claude,cursor,vscode,"
-            "windsurf,trae,qoder,workbuddy,dsh (default: all)"
+            "windsurf,trae,qoder,workbuddy,zcode,dsh (default: all)"
         ),
     )
     parser.add_argument("--skip-install", action="store_true", help="only write client configs")
