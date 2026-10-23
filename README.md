@@ -102,6 +102,7 @@ python scripts/install.py --mcp-key mcp_xxx
 - **Windsurf**：`~/.codeium/windsurf/mcp_config.json`
 - **Trae / Qoder**：`%APPDATA%\<App>\User\mcp.json`
 - **WorkBuddy**：`~/.workbuddy/mcp.json`
+- **ZCode（智谱）**：`~/.zcode/cli/config.json`（`mcp.servers` 键，桌面端与 CLI 共用）
 - **DSH 桌面端 / Web 端**：各自 profile 的 `~/.dsh/profiles/{desktop,web}/cordis.patch.yml`
 
 客户端按「已安装才写」处理：配置文件、应用数据目录或可执行文件任一存在即视为已安装，否则跳过。
@@ -258,6 +259,30 @@ Cursor 目前走 `initialize` 握手（协议 `2025-11-25`），由同一个 SDK
 ```
 
 > 三种客户端的协议版本不同（握手式 `2025-11-25` 与无状态 `2026-07-28`），它们共用同一套工具实现；**没有**哪一种传输模式能通吃所有客户端，所以 stdio 作为默认兜底。
+
+### ZCode
+
+ZCode 的桌面端与自带 CLI 读同一份 `~/.zcode/cli/config.json`，服务器放在 `mcp.servers` 下，
+条目形态与 VS Code 一致（多一个 `type`）：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "ssh": {
+        "type": "stdio",
+        "command": "python",
+        "args": ["-m", "ssh_mcp"],
+        "env": { "MCP_KEY": "mcp_xxx" }
+      }
+    }
+  }
+}
+```
+
+这份文件同时是 ZCode agent 自己的配置（主题、provider、其它 MCP 服务器都在里面），
+`install.py` 只增删 `mcp.servers.ssh` 一项，其余键原样保留，写前留 `.bak`。
+改完在 ZCode 的「设置 → MCP 服务器」里能看到该条目；若列表没刷新，重启一次应用。
 
 ## 运行
 

@@ -1,13 +1,15 @@
 """The installer's client-config writers.
 
-Only the DSH writer is covered here: it edits a file that belongs to another
-application and holds that application's own settings, so a rewrite that drops
-a line is a real regression rather than a cosmetic one.
+Only the writers that edit a file this project does not own are covered here --
+ZCode's agent config and DSH's profile patch. Both hold another application's
+own settings, so a rewrite that drops a key or a line is a real regression
+rather than a cosmetic one.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -249,3 +251,93 @@ def test_install_package_uses_the_interpreter_when_the_launcher_is_locked(instal
     assert command == str(scripts / "python.exe")
     assert not command.endswith("ssh-mcp.exe")
     assert installer.launch_argv(command) == [command, "-m", "ssh_mcp", "--transport", "stdio"]
+
+
+# -- ZCode --------------------------------------------------------------------
+
+
+def test_zcode_writer_keys_the_entry_under_mcp_servers(installer, tmp_path):
+    config = _write(
+        tmp_path / "config.json",
+        json.dumps({"mcp": {"servers": {"rea": {"type": "stdio", "command": "node.exe"}}}}),
+    )
+    target = installer.ClientTarget("ZCode", config, "zcode-json", exists=True)
+
+    installer.wire_file(target, ENTRY, dry_run=False)
+
+    data = json.loads(config.read_text(encoding="utf-8"))
+    assert data["mcp"]["servers"]["ssh"] == {"type": "stdio", **ENTRY}
+
+
+def test_zcode_writer_preserves_servers_and_settings_it_does_not_own(installer, tmp_path):
+    """The file is ZCode's own config, not a file this project owns."""
+    original = {
+        "mcp": {
+            "servers": {
+                "rea": {
+                    "type": "stdio",
+                    "command": r"C:\Program Files\nodejs\node.exe",
+                    "args": ["rea.mjs", "mcp"],
+                    "env": {"JAVA_HOME": r"C:\jdk"},
+                    "timeoutMs": 120000,
+                }
+            }
+        },
+        "theme": "dark",
+    }
+    config = _write(tmp_path / "config.json", json.dumps(original, indent=2))
+
+    installer.wire_file(installer.ClientTarget("ZCode", config, "zcode-json"), ENTRY, dry_run=False)
+
+    data = json.loads(config.read_text(encoding="utf-8"))
+    assert data["theme"] == "dark"
+    assert data["mcp"]["servers"]["rea"] == original["mcp"]["servers"]["rea"]
+
+
+def test_zcode_writer_creates_the_config_when_absent(installer, tmp_path):
+    config = tmp_path / "cli" / "config.json"
+
+    installer.wire_file(installer.ClientTarget("ZCode", config, "zcode-json"), ENTRY, dry_run=False)
+
+    data = json.loads(config.read_text(encoding="utf-8"))
+    assert data == {"mcp": {"servers": {"ssh": {"type": "stdio", **ENTRY}}}}
+
+
+def test_zcode_writer_is_idempotent(installer, tmp_path):
+    config = _write(tmp_path / "config.json", "{}\n")
+    target = installer.ClientTarget("ZCode", config, "zcode-json", exists=True)
+
+    assert installer.wire_file(target, ENTRY, dry_run=False) is None
+    assert target.changed is True
+    before = config.read_text(encoding="utf-8")
+
+    again = installer.ClientTarget("ZCode", config, "zcode-json", exists=True)
+    installer.wire_file(again, ENTRY, dry_run=False)
+
+    assert again.changed is False
+    assert config.read_text(encoding="utf-8") == before
+
+
+def test_zcode_writer_leaves_the_file_alone_on_dry_run(installer, tmp_path):
+    config = _write(tmp_path / "config.json", "{}\n")
+    target = installer.ClientTarget("ZCode", config, "zcode-json")
+
+    installer.wire_file(target, ENTRY, dry_run=True)
+
+    assert target.changed is True
+    assert config.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_zcode_spec_exists_even_before_the_client_runs(installer, monkeypatch, tmp_path):
+    """A discovered-but-absent client is reported, not silently dropped."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(installer, "_home", lambda: home)
+
+    specs = {spec.label: spec for spec in installer._client_specs()}
+
+    spec = specs["ZCode"]
+    assert spec.file == home / ".zcode/cli/config.json"
+    assert spec.format == "zcode-json"
+    assert spec.binaries == ("zcode",)
+    assert spec.file not in spec.markers, "the config being present is already checked separately"
