@@ -72,8 +72,10 @@ python -m pip install dist/ssh_mcp-0.1.0-py3-none-any.whl
 | `SSH_MCP_MAX_CONCURRENT_CONNECTS` | 4 | 同时进行的 SSH 握手上限；防止对卡住的主机堆积半开连接 |
 | `SSH_MCP_STATE_DIR` | `~/.ssh-mcp` | known_hosts、Ed25519 私钥、认证状态 |
 | `SSH_MCP_SFTP_BLOCK_SIZE` | 256 KiB | SFTP 请求流水线块大小 |
-| `SSH_MCP_SFTP_IDLE_TIMEOUT` | 60 s | 连续无数据即中止（大文件主超时） |
+| `SSH_MCP_SFTP_IDLE_TIMEOUT` | 180 s | 完全无进展多少秒才中止。这是**下限**：链路慢时按上一次分块耗时自动放宽（见「传输语义」） |
 | `SSH_MCP_SFTP_TOTAL_TIMEOUT` | 0（关闭） | 可选的总时长上限 |
+| `SSH_MCP_SFTP_RETRY_ATTEMPTS` | 3 | 断线/停滞后的自动续传次数，0 关闭 |
+| `SSH_MCP_SFTP_RETRY_DELAY` | 3 s | 首次重试前等待，之后每次翻倍（上限 60 s） |
 | `SSH_MCP_HTTP_TOKEN` | 空 | HTTP 入站 Bearer；绑定非回环地址时必填 |
 | `SSH_MCP_LOG_LEVEL` | INFO | 日志只写 stderr，敏感串自动脱敏 |
 
@@ -367,6 +369,26 @@ handle 只在两种情况下失效：**显式 `disconnect`**，或关闭后超�
 - 续传前校验 `.part` 不超过源大小，超出则丢弃重传。
 - `verify=size` 默认；`sha256` 会分别计算源/目标哈希（返回 `hash_seconds`）。
 - 进度按 **每 1% 或每 5 秒** 节流，通过 MCP progress notification 上报。
+
+### 超时与自动续传
+
+传输的超时不是一个固定秒数，而是一个**会随实际速度放宽的下限**：
+
+```
+单步允许时长 = max(SSH_MCP_SFTP_IDLE_TIMEOUT, 4 × 上一次分块耗时)
+```
+
+固定的 60 秒在局域网上很宽松，但在丢包的移动网络或跨境链路上，1 MiB 分块本身就可能传上一分钟——
+传输明明在走，却被判成超时。改成自适应后，**慢但活着**永远不会触发超时，**完全没动静**仍会在
+`SSH_MCP_SFTP_IDLE_TIMEOUT`（默认 180 秒）后放弃。
+
+超时或断链后不再直接把错误抛给调用方：引擎会换一条新的 SFTP 通道（必要时经由连接池重连，
+`connection_handle` 不变），从 `.part` 里**实际落盘的字节数**继续传，最多 `SSH_MCP_SFTP_RETRY_ATTEMPTS`
+次，间隔按 `SSH_MCP_SFTP_RETRY_DELAY` 指数退避。
+
+只重试确实可能自愈的错误（连接丢失、SFTP 会话中断、停滞）。权限拒绝、文件不存在这类服务端明确答复
+不会重试——它们每次都一样，重试只是把同一个结果延迟几分钟。重试预算用尽后仍返回
+`transfer_idle_timeout` / `transfer_failed`，`.part` 保留，可再次调用续传。
 
 ## 安全
 

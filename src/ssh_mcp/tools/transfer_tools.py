@@ -84,6 +84,7 @@ class TransferTools:
                         create_parent_dirs=create_parent_dirs,
                         progress=self._progress_fn(ctx, progress),
                         conn=acquired.conn,
+                        refresh=self._refresher(acquired),
                     )
             except ToolFailure as exc:
                 return tool_err(exc)
@@ -140,6 +141,7 @@ class TransferTools:
                         verify=verify,
                         progress=self._progress_fn(ctx, progress),
                         conn=acquired.conn,
+                        refresh=self._refresher(acquired),
                     )
             except ToolFailure as exc:
                 return tool_err(exc)
@@ -224,6 +226,21 @@ class TransferTools:
 
     # -- helpers --------------------------------------------------------------
 
+    def _refresher(self, acquired):
+        """Give the engine a way to rebuild its SFTP channel after a retryable break.
+
+        A stale channel lives on a dead connection, so a retry needs both a
+        reconnected transport and a new channel on top of it. The pool keeps
+        the handle valid across reconnects, so this only has to make sure the
+        cached ``sftp`` is thrown away first -- otherwise ``sftp_client()``
+        hands back the same dead client and the retry fails identically.
+        """
+
+        async def refresh():
+            return await self._pool.sftp_for(acquired.entry, force_new=True)
+
+        return refresh
+
     def _progress_fn(self, ctx: Context, enabled: bool):
         if not enabled:
             return None
@@ -290,6 +307,7 @@ class TransferTools:
                             create_parent_dirs=create_parent_dirs,
                             progress=None,
                             conn=acquired.conn,
+                            refresh=self._refresher(acquired),
                         )
                     else:
                         result = await self._engine.download(
@@ -301,6 +319,7 @@ class TransferTools:
                             verify=verify,
                             progress=None,
                             conn=acquired.conn,
+                            refresh=self._refresher(acquired),
                         )
                     results[index] = {"ok": True, **pair.model_dump(), **result.to_dict()}
                 except ToolFailure as exc:

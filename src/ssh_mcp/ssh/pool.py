@@ -356,7 +356,10 @@ class ConnectionPool:
                     connection_handle=entry.handle,
                 ) from None
             try:
-                result = await self._connector.connect(payload)
+                # Same gate as ``connect``: a reconnect is a handshake too, and
+                # a link flapping on many handles must not bypass the ceiling.
+                async with self._connect_gate:
+                    result = await self._connector.connect(payload)
             except ConnectFailure as exc:
                 raise ToolFailure(
                     exc.error,
@@ -385,14 +388,30 @@ class ConnectionPool:
         entry.in_flight = max(0, entry.in_flight - 1)
         entry.touch()
 
-    async def sftp_for(self, entry: PoolEntry) -> asyncssh.SFTPClient:
-        """Return the entry's shared SFTP channel, opening it on first use."""
+    async def sftp_for(self, entry: PoolEntry, *, force_new: bool = False) -> asyncssh.SFTPClient:
+        """Return the entry's shared SFTP channel, opening it on first use.
+
+        ``force_new`` drops the cached channel first. A channel outlives
+        nothing: once its transport is gone it stays gone, so a transfer that
+        wants to retry after a dropped connection must ask for a fresh one
+        rather than the cached handle.
+        """
+        if force_new:
+            old, entry.sftp = entry.sftp, None
+            if old is not None:
+                with contextlib.suppress(Exception):
+                    old.exit()
         if entry.sftp is not None:
             return entry.sftp
         async with entry.sftp_lock:
             if entry.sftp is not None:
                 return entry.sftp
             conn = entry.conn
+            if conn is None or conn.is_closed():
+                # Rebuild the transport in place; the handle survives, so a
+                # retrying transfer does not have to reconnect by hand.
+                await self._reconnect(entry)
+                conn = entry.conn
             if conn is None or conn.is_closed():
                 raise ConnectionMissing(entry.handle)
             entry.sftp = await conn.start_sftp_client()

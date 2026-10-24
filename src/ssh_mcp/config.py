@@ -158,8 +158,14 @@ class Settings:
     sftp_block_size: int = 256 * 1024
     sftp_max_requests: int = 16
     sftp_buffer_size: int = 1024 * 1024
-    sftp_idle_timeout: float = 60.0
+    # Floor for "no progress at all"; a slow but moving link widens it (see
+    # _StallGuard). Keep it above one 1 MiB write on a slow uplink.
+    sftp_idle_timeout: float = 180.0
     sftp_total_timeout: float | None = None
+    # Extra attempts after a transient failure. Every retry resumes from the
+    # .part file, so a flaky link costs time, not the whole upload.
+    sftp_retry_attempts: int = 3
+    sftp_retry_delay: float = 3.0
     sftp_concurrency: int = 4
     sftp_intolerant_block_size: int = 64 * 1024
     directory_page_limit: int = 500
@@ -355,8 +361,10 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         sftp_buffer_size=src.integer(
             "SSH_MCP_SFTP_BUFFER_SIZE", "sftp_buffer_size", 1024 * 1024, minimum=64 * 1024, maximum=8 * 1024 * 1024
         ),
-        sftp_idle_timeout=src.number("SSH_MCP_SFTP_IDLE_TIMEOUT", "sftp_idle_timeout", 60.0, minimum=1.0),
+        sftp_idle_timeout=src.number("SSH_MCP_SFTP_IDLE_TIMEOUT", "sftp_idle_timeout", 180.0, minimum=1.0),
         sftp_total_timeout=sftp_total_timeout,
+        sftp_retry_attempts=src.integer("SSH_MCP_SFTP_RETRY_ATTEMPTS", "sftp_retry_attempts", 3, minimum=0, maximum=10),
+        sftp_retry_delay=src.number("SSH_MCP_SFTP_RETRY_DELAY", "sftp_retry_delay", 3.0, minimum=0.0, maximum=60.0),
         sftp_concurrency=src.integer("SSH_MCP_SFTP_CONCURRENCY", "sftp_concurrency", 4, minimum=1, maximum=16),
         sftp_intolerant_block_size=src.integer(
             "SSH_MCP_SFTP_FALLBACK_BLOCK_SIZE", "sftp_intolerant_block_size", 64 * 1024, minimum=16 * 1024

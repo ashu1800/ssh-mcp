@@ -1,7 +1,8 @@
 """SFTP transfer engine.
 
 Both directions stream through a fixed-size buffer with baked-in resumability,
-atomic commit, throttled progress, idle timeout, and size/hash verification.
+atomic commit, throttled progress, an adaptive stall timeout, automatic retry,
+and size/hash verification.
 
 Upload:
 
@@ -12,7 +13,8 @@ Download:
     <remote> --(1 MiB chunks)--> <local>.part --(os.replace)--> <local>
 
 Failure keeps the ``.part`` file so a retry resumes; a *verification* failure
-deletes it because the partial data is known to be wrong.
+deletes it because the partial data is known to be wrong. Transient breakage
+is retried in-process, each attempt continuing from the bytes already written.
 """
 
 from __future__ import annotations
@@ -37,6 +39,9 @@ from ssh_mcp.ssh.sftp_ops import replace_file
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[int, int | None], Awaitable[None]]
+# Rebuilds the SFTP channel onto a live connection after a retry-worthy break.
+RefreshFn = Callable[[], Awaitable[asyncssh.SFTPClient]]
+StallFn = Callable[[float], "_IdleStall"]
 
 HASH_CHUNK = 1024 * 1024
 
@@ -76,6 +81,60 @@ class TransferResult:
         if self.local_hash:
             payload["local_sha256"] = self.local_hash
         return payload
+
+
+class _StallGuard:
+    """Per-step timeout that widens with the throughput actually observed.
+
+    One fixed number cannot serve both ends of the range. Writing one 1 MiB
+    chunk takes about a second at 1 MiB/s and closer to a minute on a 20 KiB/s
+    uplink with retransmits, so a flat 60 s limit that looks generous on a LAN
+    sits one bad minute away from aborting a transfer that is still moving.
+    Conversely a peer that has stopped answering must not hold the tool open
+    until the client gives up.
+
+    The budget is therefore ``max(floor, factor * previous_step)``: a link that
+    is slow but alive widens its own allowance, while a silent peer still trips
+    the configured floor.
+    """
+
+    def __init__(self, floor: float, deadline: float | None = None, factor: float = 4.0) -> None:
+        self._floor = floor
+        self._deadline = deadline
+        self._factor = factor
+        self._last = 0.0
+        self.steps = 0
+
+    @property
+    def budget(self) -> float:
+        return max(self._floor, self._last * self._factor)
+
+    def remaining_total(self) -> float | None:
+        if self._deadline is None:
+            return None
+        return self._deadline - time.monotonic()
+
+    async def step(self, awaitable, *, stall_factory=None):
+        """Await one I/O step under the adaptive idle timeout and total deadline."""
+        allowed = self.budget
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise _TotalTimeout
+            allowed = min(allowed, remaining)
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(allowed):
+                result = await awaitable
+        except TimeoutError:
+            if self._deadline is not None and time.monotonic() >= self._deadline:
+                raise _TotalTimeout from None
+            if stall_factory is not None:
+                raise stall_factory(allowed) from None
+            raise
+        self._last = time.monotonic() - started
+        self.steps += 1
+        return result
 
 
 class _ProgressReporter:
@@ -153,6 +212,7 @@ class SftpTransferEngine:
         create_parent_dirs: bool = False,
         progress: ProgressFn | None = None,
         conn: asyncssh.SSHClientConnection | None = None,
+        refresh: RefreshFn | None = None,
     ) -> TransferResult:
         started = time.monotonic()
         remote_path = validate_remote_path(remote_path)
@@ -189,46 +249,21 @@ class SftpTransferEngine:
             logger.info("discarding oversized partial upload %s", part_path)
 
         block_size = self._block_size(sftp)
-        deadline = self._deadline()
         reporter = _ProgressReporter(progress, source_size)
-        transferred = resumed_from
-        await reporter.update(transferred)
-
-        remote_handle = None
-        local_handle = None
-        try:
-            mode = "r+b" if resumed_from else "wb"
-            remote_handle = await self._open_with_fallback(sftp, part_path, mode, block_size)
-            if resumed_from:
-                await remote_handle.seek(resumed_from)
-            local_handle = await asyncio.to_thread(open, local_path, "rb")
-            if resumed_from:
-                await asyncio.to_thread(local_handle.seek, resumed_from)
-
-            while True:
-                chunk = await asyncio.to_thread(local_handle.read, self._settings.sftp_buffer_size)
-                if not chunk:
-                    break
-                await self._step(remote_handle.write(chunk), deadline)
-                transferred += len(chunk)
-                await reporter.update(transferred)
-        except asyncio.CancelledError:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
-            logger.warning("upload of %s cancelled after %d bytes; .part kept for resume", remote_path, transferred)
-            raise
-        except ToolFailure:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
-            await self._delete_quietly(sftp, part_path)
-            raise
-        except BaseException as exc:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
-            raise self._transfer_error("upload", str(local_path), remote_path, transferred, source_size, exc) from None
-        else:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
+        transferred, resumed_from, sftp = await self._with_retries(
+            "upload",
+            str(local_path),
+            remote_path,
+            source_size,
+            reporter,
+            lambda client, offset, guard: self._upload_body(
+                client, local_path, part_path, source_size, offset, block_size, guard, reporter
+            ),
+            initial_offset=resumed_from,
+            refresh=refresh,
+            conn=conn,
+            sftp=sftp,
+        )
 
         await reporter.finish(transferred)
         hash_seconds = None
@@ -279,6 +314,51 @@ class SftpTransferEngine:
             atomic=atomic,
         )
 
+    async def _upload_body(
+        self,
+        sftp: asyncssh.SFTPClient,
+        local_path: Path,
+        part_path: str,
+        source_size: int,
+        resumed_from: int,
+        block_size: int,
+        guard: _StallGuard,
+        reporter: _ProgressReporter,
+    ) -> int:
+        """Stream ``local_path`` into ``part_path`` from ``resumed_from``; return the offset reached.
+
+        The remote handle is what dies with a connection, so it is opened here
+        rather than by the caller: a retry re-enters the whole body with a
+        fresh client and picks up where the previous attempt stopped.
+        """
+        remote_handle = None
+        local_handle = None
+        transferred = resumed_from
+        try:
+            mode = "r+b" if resumed_from else "wb"
+            remote_handle = await self._open_with_fallback(sftp, part_path, mode, block_size)
+            if resumed_from:
+                await remote_handle.seek(resumed_from)
+            local_handle = await asyncio.to_thread(open, local_path, "rb")
+            if resumed_from:
+                await asyncio.to_thread(local_handle.seek, resumed_from)
+            await reporter.update(transferred)
+
+            while True:
+                chunk = await asyncio.to_thread(local_handle.read, self._settings.sftp_buffer_size)
+                if not chunk:
+                    break
+                await guard.step(remote_handle.write(chunk), stall_factory=_stall("upload"))
+                transferred += len(chunk)
+                await reporter.update(transferred)
+        finally:
+            # Cleanup must not decide the outcome: closing a handle that lived
+            # on a now-dead channel raises, and letting that propagate would
+            # discard a body that had already finished writing every byte.
+            await self._close_quietly(remote_handle)
+            await self._close_local(local_handle)
+        return transferred
+
     # -- download -------------------------------------------------------------
 
     async def download(
@@ -292,6 +372,7 @@ class SftpTransferEngine:
         verify: str = "size",
         progress: ProgressFn | None = None,
         conn: asyncssh.SSHClientConnection | None = None,
+        refresh: RefreshFn | None = None,
     ) -> TransferResult:
         started = time.monotonic()
         remote_path = validate_remote_path(remote_path)
@@ -332,45 +413,21 @@ class SftpTransferEngine:
             logger.info("discarding oversized partial download %s", part_path)
 
         block_size = self._block_size(sftp)
-        deadline = self._deadline()
         reporter = _ProgressReporter(progress, source_size)
-        transferred = resumed_from
-
-        remote_handle = None
-        local_handle = None
-        try:
-            remote_handle = await self._open_with_fallback(sftp, remote_path, "rb", block_size)
-            if resumed_from:
-                await remote_handle.seek(resumed_from)
-            local_handle = await asyncio.to_thread(open, part_path, "r+b" if resumed_from else "wb")
-            if resumed_from:
-                await asyncio.to_thread(local_handle.seek, resumed_from)
-            await reporter.update(transferred)
-
-            while True:
-                chunk = await self._step(remote_handle.read(self._settings.sftp_buffer_size), deadline)
-                if not chunk:
-                    break
-                await asyncio.to_thread(local_handle.write, chunk)
-                transferred += len(chunk)
-                await reporter.update(transferred)
-        except asyncio.CancelledError:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
-            logger.warning("download of %s cancelled after %d bytes; .part kept for resume", remote_path, transferred)
-            raise
-        except ToolFailure:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
-            await self._delete_local_quietly(part_path)
-            raise
-        except BaseException as exc:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
-            raise self._transfer_error("download", str(local_path), remote_path, transferred, source_size, exc) from None
-        else:
-            await self._close_quietly(remote_handle)
-            await self._close_local(local_handle)
+        transferred, resumed_from, sftp = await self._with_retries(
+            "download",
+            str(local_path),
+            remote_path,
+            source_size,
+            reporter,
+            lambda client, offset, guard: self._download_body(
+                client, remote_path, part_path, offset, block_size, guard, reporter
+            ),
+            initial_offset=resumed_from,
+            refresh=refresh,
+            conn=conn,
+            sftp=sftp,
+        )
 
         await reporter.finish(transferred)
         hash_seconds = None
@@ -418,6 +475,209 @@ class SftpTransferEngine:
             atomic=True,
         )
 
+    async def _download_body(
+        self,
+        sftp: asyncssh.SFTPClient,
+        remote_path: str,
+        part_path: Path,
+        resumed_from: int,
+        block_size: int,
+        guard: _StallGuard,
+        reporter: _ProgressReporter,
+    ) -> int:
+        """Pull ``remote_path`` into ``part_path`` from ``resumed_from``; return the offset reached."""
+        remote_handle = None
+        local_handle = None
+        transferred = resumed_from
+        try:
+            remote_handle = await self._open_with_fallback(sftp, remote_path, "rb", block_size)
+            if resumed_from:
+                await remote_handle.seek(resumed_from)
+            local_handle = await asyncio.to_thread(open, part_path, "r+b" if resumed_from else "wb")
+            if resumed_from:
+                await asyncio.to_thread(local_handle.seek, resumed_from)
+            await reporter.update(transferred)
+
+            while True:
+                chunk = await guard.step(
+                    remote_handle.read(self._settings.sftp_buffer_size), stall_factory=_stall("download")
+                )
+                if not chunk:
+                    break
+                await asyncio.to_thread(local_handle.write, chunk)
+                transferred += len(chunk)
+                await reporter.update(transferred)
+        finally:
+            await self._close_quietly(remote_handle)
+            await self._close_local(local_handle)
+        return transferred
+
+    async def _with_retries(
+        self,
+        direction: str,
+        local_path: str,
+        remote_path: str,
+        source_size: int,
+        reporter: _ProgressReporter,
+        attempt,
+        *,
+        initial_offset: int,
+        refresh: RefreshFn | None,
+        conn: asyncssh.SSHClientConnection | None,
+        sftp: asyncssh.SFTPClient,
+        guard: _StallGuard | None = None,
+    ) -> tuple[int, int, asyncssh.SFTPClient]:
+        """Run ``attempt(client, offset, guard)`` until it completes or the retry budget runs out.
+
+        A dropped connection is the failure this exists for: the bytes already
+        on disk are fine, so the next attempt reopens the file and continues
+        from the last committed offset instead of restarting from zero. Only
+        failures that looked transient are retried -- a permission denial or a
+        vanished source fails immediately, because retrying it just delays the
+        same answer.
+
+        Returns ``(transferred, resumed_from, client)``; ``resumed_from`` is the
+        offset the *first* attempt started at, so the reported resume point
+        describes the caller's transfer, not the internal retry. ``client`` is
+        the channel the last attempt used -- after a reconnect it is *not* the
+        one passed in, and verifying or committing on the old one would fail on
+        a connection that no longer exists.
+        """
+        attempts = max(0, int(self._settings.sftp_retry_attempts))
+        budget = attempts + 1
+        offset = initial_offset
+        last_exc: BaseException | None = None
+        for attempt_number in range(1, budget + 1):
+            # A fresh guard per retry: the previous attempt's step timings
+            # describe a connection that no longer exists.
+            if attempt_number > 1 or guard is None:
+                guard = self._guard()
+            try:
+                reached = await attempt(sftp, offset, guard)
+            except (asyncio.CancelledError, _TotalTimeout):
+                raise
+            except asyncssh.SFTPError as exc:
+                # A server-side refusal (no such file, permission, disk full)
+                # answers the same way every time; only a lost session is worth
+                # another attempt, and that one is transient by nature.
+                if not _is_transient(exc):
+                    raise self._transfer_error(
+                        direction, local_path, remote_path, offset, source_size, exc
+                    ) from None
+                last_exc = exc
+            except (asyncssh.ConnectionLost, ConnectionError, OSError, _IdleStall) as exc:
+                last_exc = exc
+            else:
+                return reached, initial_offset, sftp
+            if attempt_number >= budget:
+                break
+            delay = self._retry_delay(attempt_number)
+            logger.warning(
+                "%s of %s interrupted at %d/%d bytes (%s); retry %d/%d in %.1fs",
+                direction,
+                remote_path,
+                offset,
+                source_size,
+                type(last_exc).__name__,
+                attempt_number,
+                attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            offset, sftp = await self._recover_connection(
+                direction, local_path, remote_path, offset, source_size, refresh, sftp
+            )
+            continue
+        assert last_exc is not None
+        raise self._transfer_error(direction, local_path, remote_path, offset, source_size, last_exc) from None
+
+    def _retry_error(self, direction: str, local_path: str, remote_path: str, transferred: int, total: int):
+        """The failure reported when the transport cannot be rebuilt for a retry."""
+        return ToolFailure(
+            "connection_lost",
+            stage=direction,
+            hint=(
+                "传输中断后无法重建 SSH 连接，已停止重试；临时文件已保留，"
+                "请重新 connect（或稍后重试），再用 resume=true 续传。"
+            ),
+            retryable=True,
+            local_path=local_path,
+            remote_path=remote_path,
+            bytes_transferred=transferred,
+            total_bytes=total,
+            resumable=True,
+        )
+
+    async def _recover_connection(
+        self,
+        direction: str,
+        local_path: str,
+        remote_path: str,
+        offset: int,
+        source_size: int,
+        refresh: RefreshFn | None,
+        sftp: asyncssh.SFTPClient,
+    ) -> tuple[int, asyncssh.SFTPClient]:
+        """Return a usable SFTP client for the next attempt, and where to resume.
+
+        The transport underneath may be gone: a reconnect rebuilds the SSH
+        connection (the pool keeps the handle), and a fresh SFTP channel on it
+        is what the next attempt needs. When the caller cannot supply a new
+        one, the old client is handed back and the next attempt fails again --
+        which the retry loop reports, rather than claiming success.
+
+        The resume offset is re-read from disk either way, because the bytes
+        that landed before the break are real whether or not the channel can be
+        replaced.
+        """
+        new_sftp = sftp
+        if refresh is not None:
+            try:
+                new_sftp = await refresh()
+            except Exception as exc:  # noqa: BLE001 - a failed reconnect is the retry's failure
+                logger.warning("could not rebuild the SFTP channel for retry: %s", type(exc).__name__)
+        if _channel_dead(new_sftp):
+            # ``refresh`` can still hand back the old channel: the pool reuses a
+            # cached one, and a pool that could not reconnect returns what it
+            # had. Retrying on that is guaranteed to fail the same way, so say
+            # so instead of burning the whole budget on identical attempts.
+            if refresh is not None:
+                logger.warning("SFTP channel is still closed after a reconnect attempt; giving up on retry")
+                raise self._retry_error(direction, local_path, remote_path, offset, source_size)
+            return offset, new_sftp
+        # Re-plan from what actually made it to disk after the break. A fresh
+        # channel whose server is slow to answer must not turn the probe itself
+        # into the failure -- keep the offset we already have if it cannot tell.
+        try:
+            if direction == "upload":
+                exists, size = await _stat_size(new_sftp, remote_path + ".part")
+            else:
+                part = Path(local_path).with_name(Path(local_path).name + ".part")
+                exists = await asyncio.to_thread(part.is_file)
+                size = await asyncio.to_thread(lambda: part.stat().st_size) if exists else 0
+        except (asyncssh.Error, OSError) as exc:
+            logger.warning("could not re-read the partial file after a break (%s); keeping offset %d", type(exc).__name__, offset)
+            return offset, new_sftp
+        if exists and 0 < size <= source_size:
+            if size < offset:
+                logger.warning(
+                    "%s retry: %s holds %d bytes but %d were reported written; resuming from %d",
+                    direction,
+                    remote_path,
+                    size,
+                    offset,
+                    size,
+                )
+            offset = size
+        return offset, new_sftp
+
+    def _retry_delay(self, attempt_number: int) -> float:
+        base = max(0.0, float(self._settings.sftp_retry_delay))
+        return min(base * (2 ** (attempt_number - 1)), 60.0)
+
+    def _guard(self) -> _StallGuard:
+        return _StallGuard(self._settings.sftp_idle_timeout, self._deadline())
+
     # -- helpers --------------------------------------------------------------
 
     def _block_size(self, sftp: asyncssh.SFTPClient) -> int:
@@ -454,21 +714,6 @@ class SftpTransferEngine:
         assert last_error is not None
         raise last_error
 
-    async def _step(self, awaitable, deadline: float | None = None):
-        """Await one I/O step under the idle timeout, and an optional total deadline."""
-        allowed = self._settings.sftp_idle_timeout
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _TotalTimeout
-            allowed = min(allowed, remaining)
-        try:
-            async with asyncio.timeout(allowed):
-                return await awaitable
-        except TimeoutError:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise _TotalTimeout from None
-            raise
 
     async def _plan_resume(
         self,
@@ -666,12 +911,27 @@ class SftpTransferEngine:
                 total_bytes=total,
                 resumable=True,
             )
+        if isinstance(exc, _IdleStall):
+            return ToolFailure(
+                "transfer_idle_timeout",
+                stage=direction,
+                hint=(
+                    f"连续 {exc.allowed:.0f} 秒没有进展，已中止传输；"
+                    "临时文件已保留，可使用 resume=true 续传或调大 SSH_MCP_SFTP_IDLE_TIMEOUT。"
+                ),
+                retryable=True,
+                local_path=local_path,
+                remote_path=remote_path,
+                bytes_transferred=transferred,
+                total_bytes=total,
+                resumable=True,
+            )
         if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
             return ToolFailure(
                 "transfer_idle_timeout",
                 stage=direction,
                 hint=(
-                    f"连续 {self._settings.sftp_idle_timeout:.0f} 秒没有收到数据，已中止传输；"
+                    f"连续 {self._settings.sftp_idle_timeout:.0f} 秒没有进展，已中止传输；"
                     "临时文件已保留，可使用 resume=true 续传。"
                 ),
                 retryable=True,
@@ -732,6 +992,47 @@ async def _stat_local_part(part: _LocalPart) -> tuple[bool, int]:
 
 class _TotalTimeout(Exception):
     """The configured total transfer budget was exhausted."""
+
+
+class _IdleStall(Exception):
+    """No byte moved for the whole adaptive budget; the peer stopped answering."""
+
+    def __init__(self, direction: str, allowed: float) -> None:
+        super().__init__(f"{direction} stalled for {allowed:.0f}s")
+        self.direction = direction
+        self.allowed = allowed
+
+
+def _stall(direction: str) -> StallFn:
+    return lambda allowed: _IdleStall(direction, allowed)
+
+
+# Failures that mean "the session, not the request, is gone". ``NoConnection``
+# is what a dead transport actually raises on the next write (checked against
+# asyncssh 2.24); ``ConnectionLost`` is the variant raised while a session is
+# being torn down. A server refusal -- permission, no such file, quota -- is
+# deliberately absent: retrying that only delays the same answer.
+_TRANSIENT_SFTP_ERRORS = (asyncssh.SFTPConnectionLost, asyncssh.SFTPNoConnection, asyncssh.SFTPEOFError)
+
+
+def _is_transient(exc: asyncssh.SFTPError) -> bool:
+    """Whether an SFTP error describes a broken session rather than a refusal."""
+    return isinstance(exc, _TRANSIENT_SFTP_ERRORS)
+
+
+def _channel_dead(sftp: asyncssh.SFTPClient) -> bool:
+    """Whether the SFTP client's channel has already closed.
+
+    AsyncSSH keeps no public accessor for this, so it reads the writer's
+    channel. A closed channel never reopens; a client that wraps one is only
+    useful for raising ``SFTPNoConnection`` on the next request.
+    """
+    try:
+        writer = getattr(getattr(sftp, "_handler", None), "_writer", None)
+        channel = getattr(writer, "channel", None)
+        return channel is None or channel.is_closing()
+    except Exception:  # noqa: BLE001 - a shape change must not break transfers
+        return False
 
 
 # -- module helpers -----------------------------------------------------------
