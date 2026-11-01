@@ -7,7 +7,7 @@ import pytest
 
 from ssh_mcp.credentials.client import CredentialClient
 from ssh_mcp.errors import ToolFailure
-from tests.conftest import TOKEN
+from tests.conftest import PASSWORD, TOKEN, USERNAME
 
 
 @pytest.mark.asyncio
@@ -36,6 +36,64 @@ async def test_unknown_server_returns_structured_error(credential_client):
         await credential_client.get_credential("999")
     assert excinfo.value.error == "server_not_found"
     assert excinfo.value.retryable is True
+    assert excinfo.value.details["candidates"] == [{"server_id": "1", "alias": "fake-1"}]
+
+
+@pytest.mark.asyncio
+async def test_exact_alias_resolves_without_listing(credential_client, ssh_server):
+    payload = await credential_client.get_credential("fake-1")
+    assert payload.host == "127.0.0.1"
+    assert payload.port == ssh_server.port
+
+
+@pytest.mark.asyncio
+async def test_unique_substring_resolves(credential_client, ssh_server):
+    payload = await credential_client.get_credential("fake")
+    assert payload.port == ssh_server.port
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_match_lists_candidates(credential_client):
+    """Base fixture has one server, so substring 'fake' resolves fine here;
+    the real ambiguity case is covered by test_ambiguous_alias_offers_candidates."""
+    payload = await credential_client.get_credential("fake")
+    assert payload.host == "127.0.0.1"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_alias_offers_candidates(settings, fake_service, ssh_server):
+    from tests.conftest import build_credential_blob
+
+    fake_service._servers.append(
+        {
+            "server_id": 2,
+            "alias": "fake-2",
+            "encrypted_blob_ref": "cred-2-v1",
+            "auth_type": "password",
+            "group_name": "tests",
+            "blob": build_credential_blob(
+                settings.mcp_key,
+                {
+                    "version": 1,
+                    "server_id": 2,
+                    "alias": "fake-2",
+                    "host": "127.0.0.1",
+                    "port": ssh_server.port,
+                    "username": USERNAME,
+                    "auth": {"type": "password"},
+                    "password": PASSWORD,
+                },
+            ),
+        }
+    )
+    client = CredentialClient(settings, transport=httpx2.MockTransport(fake_service.handler))
+    with pytest.raises(ToolFailure) as excinfo:
+        await client.get_credential("fake")
+    assert excinfo.value.error == "server_ambiguous"
+    assert len(excinfo.value.details["candidates"]) == 2
+    # The exact id still wins over the substring.
+    payload = await client.get_credential("2")
+    assert payload.alias == "fake-2"
 
 
 @pytest.mark.asyncio

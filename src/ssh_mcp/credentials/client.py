@@ -82,24 +82,41 @@ class CredentialClient:
     async def get_credential(self, server_id: str, *, refresh: bool = False) -> CredentialPayload:
         """Return the decrypted payload for ``server_id``.
 
+        ``server_id`` may be the numeric id, the exact alias (case-insensitive),
+        or a substring matching exactly one server -- so an AI client can say
+        ``connect("web-prod")`` without a ``list_servers`` round trip first.
+        Ambiguity and misses return the candidate list so the next attempt is
+        self-correcting.
+
         Refreshes the list once when the server is absent from a cached response
-        (a server added or re-keyed since the last fetch), then fails with
-        ``server_not_found``.
+        (a server added or re-keyed since the last fetch), then fails.
         """
         started = time.monotonic()
         entry = await self._fetch(refresh=refresh)
-        blob = self._find_blob(entry, server_id)
+        blob, state = self._resolve(entry, server_id)
         # Only re-download when the answer came from a cache that predates this
         # call; a cache that was cold or expired was fetched just now.
         if blob is None and not refresh and entry.fetched_at < started:
             entry = await self._fetch(refresh=True)
-            blob = self._find_blob(entry, server_id)
+            blob, state = self._resolve(entry, server_id)
         if blob is None:
+            candidates = [
+                {"server_id": str(item.get("server_id")), "alias": item.get("alias")}
+                for item in entry.servers
+                if isinstance(item, dict)
+            ]
+            if state == "ambiguous":
+                raise CredentialServiceError(
+                    "server_ambiguous",
+                    f"server_id={server_id} 匹配到多台服务器，请改用 candidates 中的准确 server_id 或完整别名。",
+                    retryable=False,
+                    candidates=candidates,
+                )
             raise CredentialServiceError(
                 "server_not_found",
-                f"服务器列表中不存在 server_id={server_id}，请先调用 list_servers 确认可用服务器。",
+                f"服务器列表中不存在 server_id={server_id}，可从 candidates 中选择后直接重试，无需先调用 list_servers。",
                 retryable=True,
-                server_id=server_id,
+                candidates=candidates,
             )
         # ``DecryptFailed`` is already a ``ToolFailure``; let it through as-is.
         return decrypt_blob(self._settings.mcp_key, blob)
@@ -107,14 +124,40 @@ class CredentialClient:
     # -- internals ------------------------------------------------------------
 
     @staticmethod
-    def _find_blob(entry: _CacheEntry, server_id: str) -> dict[str, Any] | None:
-        for item in entry.servers:
-            if str(item.get("server_id")) == str(server_id):
-                blob = item.get("blob")
-                if isinstance(blob, dict):
-                    return blob
-                return None
-        return None
+    def _resolve(entry: _CacheEntry, server_id: str) -> tuple[dict[str, Any] | None, str]:
+        """Match a server reference against the list; returns ``(blob, state)``.
+
+        Order: exact server_id, exact alias, unique substring on id/alias.
+        ``state`` is ``ok``, ``ambiguous`` (several hits) or ``missing``.
+        """
+        wanted = server_id.strip()
+        lowered = wanted.casefold()
+        servers = [item for item in entry.servers if isinstance(item, dict)]
+
+        def blob_of(item: dict[str, Any]) -> dict[str, Any] | None:
+            blob = item.get("blob")
+            return blob if isinstance(blob, dict) else None
+
+        for item in servers:
+            if str(item.get("server_id")) == wanted:
+                return blob_of(item), "ok"
+        alias_hits = [item for item in servers if str(item.get("alias") or "").casefold() == lowered]
+        if len(alias_hits) > 1:
+            return None, "ambiguous"
+        if len(alias_hits) == 1:
+            return blob_of(alias_hits[0]), "ok"
+        if lowered:
+            partial = [
+                item
+                for item in servers
+                if lowered in str(item.get("server_id")).casefold()
+                or lowered in str(item.get("alias") or "").casefold()
+            ]
+            if len(partial) > 1:
+                return None, "ambiguous"
+            if len(partial) == 1:
+                return blob_of(partial[0]), "ok"
+        return None, "missing"
 
     def _cache_valid(self, entry: _CacheEntry | None) -> bool:
         if entry is None:

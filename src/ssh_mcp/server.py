@@ -90,8 +90,11 @@ def create_server(settings: Settings, *, state: AppState | None = None) -> MCPSe
         version=__version__,
         instructions=(
             "通过服务器管理服务下发的加密凭据，对远端主机执行非交互式 SSH 命令并进行 SFTP 文件传输。"
-            "典型流程：list_servers 找到 server_id → resolve_server 确认目标 → connect 拿到 connection_handle → "
-            "execute_command / upload_file / download_file。破坏性操作（删除、覆盖、改权限）必须先在参数里传 confirm=true，"
+            "connect 一步即可连接：server 参数直接填用户提到的服务器名/别名/ID（支持唯一子串），"
+            "不必先调用 list_servers；完全省略 server 则重连最近一次用的服务器。"
+            "猜错时错误里会带 candidates 候选列表，改用后再试即可。"
+            "首次密码登录后本地会保存 Ed25519 密钥并写入远端 authorized_keys，之后再连自动公钥直连、无需密码。"
+            "后续工具可省略 connection_handle（默认最近连接）；破坏性操作（删除、覆盖、改权限）必须先在参数里传 confirm=true，"
             "并向用户说明后果。"
         ),
         log_level=settings.log_level,  # type: ignore[arg-type]
@@ -108,7 +111,7 @@ def create_server(settings: Settings, *, state: AppState | None = None) -> MCPSe
 
     set_error_sink(conn_pool.note_failure)
 
-    ServerTools(app, creds, conn_pool)
+    ServerTools(app, creds, conn_pool, settings)
     ExecTools(app, runner)
     TransferTools(app, conn_pool, engine, settings)
     FileTools(app, conn_pool, settings)

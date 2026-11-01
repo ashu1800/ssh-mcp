@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Annotated
 
 from mcp.types import CallToolResult
@@ -10,6 +11,7 @@ from pydantic import Field
 
 from ssh_mcp.credentials.client import CredentialClient
 from ssh_mcp.errors import ConfirmationRequired, ToolFailure
+from ssh_mcp.history import last_used, most_recent, record_connect
 from ssh_mcp.ssh.pool import ConnectionPool
 from ssh_mcp.tools.helpers import tool_err, tool_ok
 
@@ -19,9 +21,10 @@ logger = logging.getLogger(__name__)
 class ServerTools:
     """Registers ``list_servers`` / ``resolve_server`` / ``connect`` / ``disconnect``."""
 
-    def __init__(self, app, credentials: CredentialClient, pool: ConnectionPool) -> None:
+    def __init__(self, app, credentials: CredentialClient, pool: ConnectionPool, settings) -> None:
         self._credentials = credentials
         self._pool = pool
+        self._settings = settings
 
         @app.tool(
             name="list_servers",
@@ -35,33 +38,22 @@ class ServerTools:
             ] = False,
         ) -> CallToolResult:
             """列出当前 MCP 密钥可访问的 SSH 服务器，返回 server_id、别名和加密凭据引用，不包含任何明文连接信息。
-            返回 {servers: [{server_id, alias, encrypted_blob_ref, auth_type, group_name}], total, cached}。
+            返回 {servers: [{server_id, alias, encrypted_blob_ref, auth_type, group_name, last_used}], total, cached}。
+            last_used 是本地记录的最近一次成功连接时间（Unix 秒），没有记录时为 null。
             Use when 用户提到某台机器但你还不知道 server_id，或需要确认可操作范围时先调用本工具。
             """
             try:
                 servers = await self._credentials.list_servers(refresh=refresh)
             except ToolFailure as exc:
                 return tool_err(exc)
-            rows = [s.model_dump(exclude_none=True) for s in servers]
+            history = self._settings.history_path
+            rows = []
+            for s in servers:
+                row = s.model_dump(exclude_none=True)
+                used = last_used(history, s.server_id) if history else None
+                row["last_used"] = used
+                rows.append(row)
             return tool_ok({"servers": rows, "total": len(rows)})
-
-        @app.tool(
-            name="resolve_server",
-            title="解析服务器的连接摘要",
-            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
-        )
-        async def resolve_server(
-            server_id: Annotated[str, Field(description="服务器 ID，来自 list_servers 返回的 server_id。")],
-        ) -> CallToolResult:
-            """解密指定服务器的连接信息并返回脱敏摘要（host、port、username、认证类型），供真正建连前确认目标。
-            不返回密码、私钥或密文。解密失败会返回结构化的 decrypt_failed 错误。
-            Use when 需要向用户确认“接下来要连的是哪台机器”时，或 connect 之前核对目标是否与用户所说一致时。
-            """
-            try:
-                payload = await self._credentials.get_credential(str(server_id))
-            except ToolFailure as exc:
-                return tool_err(exc)
-            return tool_ok(payload.redacted_summary())
 
         @app.tool(
             name="connect",
@@ -74,28 +66,53 @@ class ServerTools:
             },
         )
         async def connect(
-            server_id: Annotated[str, Field(description="服务器 ID，来自 list_servers 返回的 server_id。")],
+            server: Annotated[
+                str | None,
+                Field(
+                    description=(
+                        "server_id、服务器别名（如 web-prod）或唯一匹配的子串。"
+                        "省略时连接最近一次成功连接的服务器（跨重启持久）。"
+                        "不确定时可直接尝试；猜错会返回 candidates 候选列表供纠正。"
+                    )
+                ),
+            ] = None,
             timeout_seconds: Annotated[
                 float | None,
                 Field(description="TCP 连接与 SSH 握手的超时秒数，默认取服务配置（约 10 秒）。"),
             ] = None,
         ) -> CallToolResult:
             """对指定服务器建立（或复用）SSH 连接，返回 connection_handle 供后续命令执行与 SFTP 工具使用。
-            返回 {connection_handle, status, auth_method, host, port, username, compression}；首次密码登录时会生成
-            本地 Ed25519 密钥并把公钥写入远端 authorized_keys，若写入了会附带说明。
+            一步即可连接：server 直接填用户提到的名字或 ID，无需先调用 list_servers；
+            省略 server 则重连最近一次用的服务器（0 参数）。首次密码登录时会生成本地 Ed25519 密钥并把公钥
+            写入远端 authorized_keys，之后再连自动公钥直连、无需密码。
             Use when 需要在该服务器上执行命令或传输文件之前；同一服务器重复调用会复用同一条连接。
             """
+            if server is None:
+                recent = most_recent(self._settings.history_path) if self._settings.history_path else None
+                if recent is None:
+                    return tool_err(
+                        ToolFailure(
+                            "no_connection_history",
+                            stage="validate",
+                            hint="本地没有连接历史，请指定 server 参数（server_id、别名或子串），或先调用 list_servers。",
+                            retryable=False,
+                            next_actions=["call_list_servers"],
+                        )
+                    )
+                server = recent["server_id"]
             try:
-                payload = await self._credentials.get_credential(str(server_id))
+                payload = await self._credentials.get_credential(str(server))
             except ToolFailure as exc:
                 return tool_err(exc)
 
             try:
                 entry = await self._pool.connect(
-                    payload, server_id=str(server_id), timeout=timeout_seconds
+                    payload, server_id=str(payload.server_id), timeout=timeout_seconds
                 )
             except ToolFailure as exc:
                 return tool_err(exc)
+            if self._settings.history_path:
+                record_connect(self._settings.history_path, str(payload.server_id), payload.alias)
             result = {
                 "connection_handle": entry.handle,
                 "status": "connected",
@@ -103,7 +120,7 @@ class ServerTools:
                 "host": payload.host,
                 "port": payload.port,
                 "username": payload.username,
-                "server_id": str(server_id),
+                "server_id": str(payload.server_id),
                 "compression": entry.compression,
             }
             if entry.warning:

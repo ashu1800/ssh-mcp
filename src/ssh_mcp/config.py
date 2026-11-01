@@ -125,6 +125,7 @@ class Settings:
     known_hosts_path: Path | None = None
     auth_state_path: Path | None = None
     keys_dir: Path | None = None
+    history_path: Path | None = None
     allowed_local_roots: list[Path] = field(default_factory=list)
     resolved_local_roots: list[Path] = field(default_factory=list)
     # Writes only; lets reads stay open while download targets are confined.
@@ -185,6 +186,8 @@ class Settings:
             self.auth_state_path = self.state_dir / "auth_state.json"
         if self.keys_dir is None:
             self.keys_dir = self.state_dir / "keys"
+        if self.history_path is None:
+            self.history_path = self.state_dir / "history.json"
         self.known_hosts_path = self.known_hosts_path.expanduser()
         self.auth_state_path = self.auth_state_path.expanduser()
         self.keys_dir = self.keys_dir.expanduser()
