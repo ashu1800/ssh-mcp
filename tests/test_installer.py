@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,10 @@ ENTRY = {
 def installer():
     spec = importlib.util.spec_from_file_location("ssh_mcp_installer", INSTALL_SCRIPT)
     module = importlib.util.module_from_spec(spec)
+    # exec_module runs @dataclass on module-level classes; dataclasses resolves
+    # string annotations via sys.modules[cls.__module__], which is None unless
+    # the module is registered first (importlib docs require this step).
+    sys.modules[spec.name] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module

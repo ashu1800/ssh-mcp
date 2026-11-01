@@ -357,6 +357,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The doctor output uses ✓/✗; a GBK console (default on zh-CN Windows)
+    # cannot encode them and would crash the command after the real work.
+    # Reconfigure stdout/stderr to UTF-8 with a GBK-fallible replacement so
+    # printing never aborts the workflow on code-page grounds.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         prog="dev.py",
         description="Repo-local dev workflow: setup, doctor, test, serve, clean.",
