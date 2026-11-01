@@ -259,7 +259,7 @@ async def test_tool_upload_survives_a_real_dropped_connection(app, settings, ssh
     """
     from tests.test_tools import call
 
-    connect, _ = await call(app, "connect", server_id="1")
+    connect, _ = await call(app, "connect", server="1")
     handle = connect["connection_handle"]
     data = bytes((i * 31 + 7) % 256 for i in range(500_000))
     local = settings.allowed_local_roots[0] / "resilient.bin"

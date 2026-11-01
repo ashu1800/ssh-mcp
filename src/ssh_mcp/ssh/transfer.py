@@ -117,17 +117,25 @@ class _StallGuard:
     async def step(self, awaitable, *, stall_factory=None):
         """Await one I/O step under the adaptive idle timeout and total deadline."""
         allowed = self.budget
+        # Decide *now* whether this step is bounded by the total deadline: a
+        # post-hoc ``monotonic() >= deadline`` check races the timer (the loop
+        # can fire its timer microseconds before the wall clock agrees), which
+        # turned a total timeout into a bare TimeoutError about half the time
+        # on Windows.
+        deadline_limited = False
         if self._deadline is not None:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 raise _TotalTimeout
-            allowed = min(allowed, remaining)
+            if allowed > remaining:
+                allowed = remaining
+                deadline_limited = True
         started = time.monotonic()
         try:
             async with asyncio.timeout(allowed):
                 result = await awaitable
         except TimeoutError:
-            if self._deadline is not None and time.monotonic() >= self._deadline:
+            if deadline_limited:
                 raise _TotalTimeout from None
             if stall_factory is not None:
                 raise stall_factory(allowed) from None
@@ -233,7 +241,7 @@ class SftpTransferEngine:
                 raise ToolFailure(
                     "remote_exists",
                     stage="prepare",
-                    hint=f"远端文件已存在：{remote_path}。如确认覆盖，请传 overwrite=true 与 confirm=true。",
+                    hint=f"远端文件已存在：{remote_path}。确认覆盖请传 overwrite=true。",
                     retryable=False,
                     remote_path=remote_path,
                 )
@@ -380,7 +388,7 @@ class SftpTransferEngine:
             raise ToolFailure(
                 "local_exists",
                 stage="prepare",
-                hint=f"本地文件已存在：{local_path}。如确认覆盖，请传 overwrite=true 与 confirm=true。",
+                hint=f"本地文件已存在：{local_path}。确认覆盖请传 overwrite=true。",
                 retryable=False,
                 local_path=str(local_path),
             )
