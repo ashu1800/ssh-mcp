@@ -18,6 +18,16 @@ from ssh_mcp.tools.helpers import tool_err, tool_ok
 
 logger = logging.getLogger(__name__)
 
+# read_file refuses files above this size: a 100 MiB log would blow the 512 KiB
+# tool-result budget anyway, and download_file is the right tool for those.
+_READ_FILE_MAX_BYTES = 8 * 1024 * 1024
+# write_file is for configs and scripts, not artifacts; the transfer engine
+# owns anything bigger.
+_WRITE_FILE_MAX_BYTES = 2 * 1024 * 1024
+# search_files walks at most this many directories per call so a typo in
+# ``path`` (say, /) cannot turn one tool call into a full-disk crawl.
+_SEARCH_DIR_BUDGET = 500
+
 
 def validate_remote_path(path: str, field: str = "path") -> str:
     if not path or not path.strip():
@@ -64,11 +74,285 @@ def _attrs_to_dict(path: str, attrs: asyncssh.SFTPAttrs) -> dict:
 
 
 class FileTools:
-    """Registers list_directory / stat_file / make_directory / remove_path / rename_path / change_permissions."""
+    """Registers list_directory / stat_file / read_file / write_file / search_files / make_directory / remove_path / rename_path / change_permissions."""
 
     def __init__(self, app, pool: ConnectionPool, settings) -> None:
         self._pool = pool
         self._settings = settings
+
+        # -- read / write ------------------------------------------------------
+
+        @app.tool(
+            name="read_file",
+            title="读取远端文本文件",
+            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
+        )
+        async def read_file(
+            path: Annotated[str, Field(description="远端文件路径。")],
+            offset: Annotated[int, Field(description="起始行号（1 起）。负数表示从文件末尾倒数，如 -50 = 最后 50 行。")] = 1,
+            limit: Annotated[int, Field(description="最多返回的行数，默认 100，上限 2000。")] = 100,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
+        ) -> CallToolResult:
+            """按行读取远端文本文件（支持负 offset 从末尾倒数），适合看配置与日志而不会撑爆上下文。
+            返回 {path, total_lines, offset, lines: [{n, text}], truncated, size_bytes}；文件超过 8 MiB 时拒绝（用 download_file）。
+            Use when 需要查看远端配置文件、日志或脚本内容；大文件先看尾部（offset=-50），需要更多再往前翻。
+            """
+            if limit < 1 or limit > 2000:
+                return tool_err(
+                    ToolFailure("invalid_argument", stage="validate", hint="limit 必须在 1..2000 之间。", retryable=False)
+                )
+            try:
+                validate_remote_path(path)
+                async with borrow(self._pool, connection_handle) as acquired:
+                    sftp = await acquired.sftp_client()
+                    try:
+                        attrs = await sftp.stat(path)
+                    except asyncssh.SFTPNoSuchFile:
+                        return tool_err(
+                            ToolFailure(
+                                "remote_not_found", stage="read", hint=f"远端文件不存在：{path}", retryable=False, path=path
+                            )
+                        )
+                    if _entry_type(attrs) == "dir":
+                        return tool_err(
+                            ToolFailure(
+                                "remote_not_a_file",
+                                stage="read",
+                                hint=f"远端路径是目录：{path}。要列目录请用 list_directory。",
+                                retryable=False,
+                                path=path,
+                            )
+                        )
+                    if (attrs.size or 0) > _READ_FILE_MAX_BYTES:
+                        return tool_err(
+                            ToolFailure(
+                                "file_too_large",
+                                stage="read",
+                                hint=f"文件 {attrs.size} 字节，超过 read_file 上限（{_READ_FILE_MAX_BYTES}）。请用 download_file 取回本地后分段查看。",
+                                retryable=False,
+                                path=path,
+                                size_bytes=attrs.size,
+                            )
+                        )
+                    async with sftp.open(path, "rb") as handle:
+                        raw = await handle.read()
+                text = raw.decode("utf-8", "replace")
+                lines = text.splitlines()
+                total = len(lines)
+                if offset < 0:
+                    start = max(0, total + offset)
+                else:
+                    start = max(0, offset - 1)
+                window = lines[start : start + limit]
+                truncated = start + len(window) < total
+                payload = {
+                    "path": path,
+                    "total_lines": total,
+                    "offset": start + 1,
+                    "lines": [{"n": start + i + 1, "text": line} for i, line in enumerate(window)],
+                    "truncated": truncated,
+                    "size_bytes": int(attrs.size or 0),
+                }
+                if truncated:
+                    payload["hint"] = (
+                        f"显示第 {start + 1}-{start + len(window)} 行，共 {total} 行。"
+                        f"继续读用 offset={start + len(window) + 1}；看末尾用负数如 offset=-100。"
+                    )
+                return tool_ok(payload)
+            except ToolFailure as exc:
+                return tool_err(exc)
+            except asyncssh.SFTPError as exc:
+                return tool_err(
+                    ToolFailure("read_failed", stage="read", hint=f"读取失败：{exc}", retryable=False, path=path)
+                )
+
+        @app.tool(
+            name="write_file",
+            title="写入远端文本文件",
+            annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+        )
+        async def write_file(
+            path: Annotated[str, Field(description="远端目标文件路径。")],
+            content: Annotated[str, Field(description="完整的 UTF-8 文本内容。")],
+            append: Annotated[bool, Field(description="为 true 时追加到文件末尾而不是覆盖。默认 false。")] = False,
+            confirm: Annotated[
+                bool, Field(description="覆盖或追加到已有文件属于破坏性操作，必须为 true 才会执行。")
+            ] = False,
+            create_parent_dirs: Annotated[bool, Field(description="为 true 时递归创建缺失的父目录。默认 false。")] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
+        ) -> CallToolResult:
+            """把 UTF-8 文本整块写入远端文件（覆盖或追加），替代在 shell 里拼 heredoc/sed。
+            覆盖写先落 <path>.ssh-mcp.tmp 再原子重命名，不会出现半截文件；追加则直接 O_APPEND。
+            返回 {path, bytes_written, appended, existed}。
+            Use when AI 需要创建或修改远端配置文件、脚本；覆盖已有文件前必须先向用户确认并传 confirm=true。
+            """
+            try:
+                validate_remote_path(path)
+                if not content:
+                    return tool_err(
+                        ToolFailure("invalid_argument", stage="validate", hint="content 不能为空（清空文件请用 remove_path 后重建）。", retryable=False)
+                    )
+                raw = content.encode("utf-8")
+                if len(raw) > _WRITE_FILE_MAX_BYTES:
+                    return tool_err(
+                        ToolFailure(
+                            "content_too_large",
+                            stage="validate",
+                            hint=f"内容 {len(raw)} 字节，超过 write_file 上限（{_WRITE_FILE_MAX_BYTES}）。大文件请用 upload_file。",
+                            retryable=False,
+                        )
+                    )
+                async with borrow(self._pool, connection_handle) as acquired:
+                    sftp = await acquired.sftp_client()
+                    existed = True
+                    try:
+                        await sftp.stat(path, follow_symlinks=False)
+                    except asyncssh.SFTPNoSuchFile:
+                        existed = False
+                    if existed and not confirm:
+                        return tool_err(
+                            ConfirmationRequired(
+                                "write_file", f"将{'追加到' if append else '覆盖'}远端已有文件 {path}", path=path, append=append
+                            )
+                        )
+                    if create_parent_dirs:
+                        parent = posixpath.dirname(path)
+                        if parent and parent != "/":
+                            try:
+                                await sftp.makedirs(parent, exist_ok=True)
+                            except asyncssh.SFTPError:
+                                pass
+                    if append:
+                        async with sftp.open(path, "ab") as handle:
+                            await handle.write(raw)
+                    else:
+                        tmp = f"{path}.ssh-mcp.tmp"
+                        async with sftp.open(tmp, "wb") as handle:
+                            await handle.write(raw)
+                        try:
+                            await sftp.chmod(tmp, 0o644)
+                        except asyncssh.SFTPError:
+                            pass
+                        await replace_file(sftp, tmp, path)
+                    return tool_ok({"path": path, "bytes_written": len(raw), "appended": append, "existed": existed})
+            except asyncssh.SFTPNoSuchFile:
+                return tool_err(
+                    ToolFailure(
+                        "remote_parent_not_found",
+                        stage="write",
+                        hint=f"父目录不存在：{posixpath.dirname(path)}。如需一并创建请传 create_parent_dirs=true。",
+                        retryable=False,
+                        path=path,
+                    )
+                )
+            except asyncssh.SFTPPermissionDenied:
+                return tool_err(
+                    ToolFailure("permission_denied", stage="write", hint=f"没有权限写入远端：{path}", retryable=False, path=path)
+                )
+            except ToolFailure as exc:
+                return tool_err(exc)
+            except asyncssh.SFTPError as exc:
+                return tool_err(
+                    ToolFailure("write_failed", stage="write", hint=f"写入失败：{exc}", retryable=False, path=path)
+                )
+
+        # -- search ------------------------------------------------------------
+
+        @app.tool(
+            name="search_files",
+            title="按通配符搜索远端文件",
+            annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
+        )
+        async def search_files(
+            path: Annotated[str, Field(description="起始目录。")],
+            pattern: Annotated[str, Field(description="glob 通配符，只匹配文件名：* 任意串、? 单字符、[seq] 字符集。如 *.log、nginx*.conf。")],
+            recursive: Annotated[bool, Field(description="为 true 时递归搜索子目录。默认 true。")] = True,
+            max_results: Annotated[int, Field(description="最多返回条数，默认 100，上限 1000。")] = 100,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
+        ) -> CallToolResult:
+            """在远端目录树里按文件名通配符找文件，返回匹配条目的路径与元信息。
+            返回 {path, pattern, matches: [{path, type, size, modified_at}], total_matches, truncated}。
+            Use when 需要定位日志、配置或产物的实际位置（“找到日志在哪”），不必一层层 list_directory 或跑 find。
+            """
+            import fnmatch
+
+            if not pattern or any(ch in pattern for ch in "\x00/"):
+                return tool_err(
+                    ToolFailure("invalid_argument", stage="validate", hint="pattern 只匹配文件名，不能包含 / 或 NUL。", retryable=False)
+                )
+            max_results = max(1, min(max_results, 1000))
+            try:
+                validate_remote_path(path)
+                async with borrow(self._pool, connection_handle) as acquired:
+                    sftp = await acquired.sftp_client()
+                    matches: list[dict] = []
+                    total = 0
+                    truncated = False
+                    stack = [path]
+                    visited = 0
+                    while stack:
+                        current = stack.pop()
+                        visited += 1
+                        if visited > _SEARCH_DIR_BUDGET:
+                            truncated = True
+                            break
+                        try:
+                            entries = [entry async for entry in sftp.scandir(current)]
+                        except asyncssh.SFTPNotADirectory:
+                            continue
+                        except asyncssh.SFTPPermissionDenied:
+                            continue
+                        for entry in entries:
+                            name = entry.filename
+                            if isinstance(name, bytes):
+                                name = name.decode("utf-8", "replace")
+                            if name in (".", ".."):
+                                continue
+                            child = posixpath.join(current, name)
+                            kind = _entry_type(entry.attrs)
+                            if kind == "dir":
+                                if recursive:
+                                    stack.append(child)
+                                continue
+                            if fnmatch.fnmatch(name.lower(), pattern.lower()):
+                                total += 1
+                                if len(matches) < max_results:
+                                    matches.append(
+                                        {
+                                            "path": child,
+                                            "type": kind,
+                                            "size": int(entry.attrs.size or 0),
+                                            "modified_at": int(entry.attrs.mtime) if entry.attrs.mtime else None,
+                                        }
+                                    )
+                    truncated = truncated or total > len(matches)
+                    payload = {
+                        "path": path,
+                        "pattern": pattern,
+                        "matches": matches,
+                        "total_matches": total,
+                        "truncated": truncated,
+                    }
+                    if truncated:
+                        payload["hint"] = (
+                            f"结果超过 max_results={max_results} 或目录数超预算，已截断。请用更具体的 path 或 pattern 缩小范围。"
+                        )
+                    return tool_ok(payload)
+            except asyncssh.SFTPNoSuchFile:
+                return tool_err(
+                    ToolFailure("remote_not_found", stage="search", hint=f"远端目录不存在：{path}", retryable=False, path=path)
+                )
+            except ToolFailure as exc:
+                return tool_err(exc)
 
         @app.tool(
             name="list_directory",

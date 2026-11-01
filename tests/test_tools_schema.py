@@ -23,12 +23,13 @@ async def test_all_expected_tools_are_registered(tools):
     assert names == {
         # discovery / connection lifecycle
         "list_servers",
-        "resolve_server",
         "connect",
         "disconnect",
         "get_connection_stats",
         # raw execution and transfers
         "execute_command",
+        "start_background_command",
+        "get_background_command",
         "upload_file",
         "download_file",
         "upload_files",
@@ -36,6 +37,9 @@ async def test_all_expected_tools_are_registered(tools):
         # remote filesystem
         "list_directory",
         "stat_file",
+        "read_file",
+        "write_file",
+        "search_files",
         "make_directory",
         "remove_path",
         "rename_path",

@@ -10,7 +10,7 @@ from mcp.server.mcpserver import Context
 from mcp.types import CallToolResult
 from pydantic import BaseModel, Field
 
-from ssh_mcp.errors import ConfirmationRequired, ToolFailure
+from ssh_mcp.errors import ToolFailure
 from ssh_mcp.ssh.pool import ConnectionPool, borrow
 from ssh_mcp.ssh.transfer import SftpTransferEngine, resolve_local_target
 from ssh_mcp.tools.helpers import tool_err, tool_ok
@@ -43,9 +43,9 @@ class TransferTools:
                 Field(description="本地文件路径（MCP 所在机器）。若设置了 SSH_MCP_ALLOWED_LOCAL_ROOTS，则必须位于其根目录内。"),
             ],
             remote_path: Annotated[str, Field(description="远端目标文件路径，如 /home/app/release.tar.gz。")],
-            overwrite: Annotated[bool, Field(description="目标已存在时是否覆盖。默认 false，会在传输前直接拒绝。")] = False,
-            confirm: Annotated[
-                bool, Field(description="覆盖写入属于破坏性操作，overwrite=true 时必须同时传 confirm=true。")
+            overwrite: Annotated[
+                bool,
+                Field(description="目标已存在时覆盖它。默认 false 直接拒绝；true 即确认覆盖（破坏性，需先向用户确认）。"),
             ] = False,
             resume: Annotated[bool, Field(description="为 true 时从 <remote>.part 的断点继续传输。默认 true。")] = True,
             verify: Annotated[
@@ -64,12 +64,6 @@ class TransferTools:
             数据先写入 <remote_path>.part，校验通过后原子重命名为目标文件；中断时 .part 会保留以便续传。
             Use when 需要把构建产物、配置或日志等本地文件送到服务器；大文件优先使用本工具而不是 execute_command + base64。
             """
-            if overwrite and not confirm:
-                return tool_err(
-                    ConfirmationRequired(
-                        "upload_file(overwrite)", f"将会覆盖远端已有文件 {remote_path}", remote_path=remote_path
-                    )
-                )
             try:
                 local = resolve_local_target(self._settings, local_path)
                 async with borrow(self._pool, connection_handle) as acquired:
@@ -102,9 +96,9 @@ class TransferTools:
                 str,
                 Field(description="本地目标路径（MCP 所在机器）。若设置了 SSH_MCP_ALLOWED_LOCAL_ROOTS，则必须位于其根目录内。"),
             ],
-            overwrite: Annotated[bool, Field(description="本地文件已存在时是否覆盖。默认 false，会在传输前直接拒绝。")] = False,
-            confirm: Annotated[
-                bool, Field(description="覆盖本地文件属于破坏性操作，overwrite=true 时必须同时传 confirm=true。")
+            overwrite: Annotated[
+                bool,
+                Field(description="本地文件已存在时覆盖它。默认 false 直接拒绝；true 即确认覆盖（破坏性，需先向用户确认）。"),
             ] = False,
             resume: Annotated[bool, Field(description="为 true 时从 <local>.part 的断点继续传输。默认 true。")] = True,
             verify: Annotated[
@@ -122,12 +116,6 @@ class TransferTools:
             数据先写入 <local_path>.part，校验通过后原子重命名为目标文件；中断时 .part 会保留以便续传。
             Use when 需要取回远端日志、备份或产物到本机；本地父目录不存在时会自动创建（仍受白名单约束）。
             """
-            if overwrite and not confirm:
-                return tool_err(
-                    ConfirmationRequired(
-                        "download_file(overwrite)", f"将会覆盖本地已有文件 {local_path}", local_path=local_path
-                    )
-                )
             try:
                 local = resolve_local_target(self._settings, local_path, write=True)
                 async with borrow(self._pool, connection_handle) as acquired:
@@ -155,8 +143,10 @@ class TransferTools:
         async def upload_files(
             ctx: Context,
             files: Annotated[list[FilePair], Field(description="待上传文件列表，每项包含 local_path 与 remote_path。")],
-            overwrite: Annotated[bool, Field(description="目标已存在时是否覆盖。默认 false，会在传输前对每个文件单独拒绝。")] = False,
-            confirm: Annotated[bool, Field(description="overwrite=true 时必须同时传 confirm=true。")] = False,
+            overwrite: Annotated[
+                bool,
+                Field(description="目标已存在时覆盖它们。默认 false 对已存在的逐个拒绝；true 即确认全部覆盖（破坏性，需先向用户确认）。"),
+            ] = False,
             resume: Annotated[bool, Field(description="为 true 时从各自的 .part 断点继续传输。默认 true。")] = True,
             verify: Annotated[
                 Literal["size", "sha256", "none"], Field(description="完整性校验方式，默认 size。")
@@ -171,10 +161,6 @@ class TransferTools:
             返回 {results: [{local_path, remote_path, ok, ...}], succeeded, failed}；单个文件失败不影响其余文件。
             Use when 一次需要上传多个文件（如整个发布包或多个配置），比逐个调用 upload_file 更高效且不会打满服务器。
             """
-            if overwrite and not confirm:
-                return tool_err(
-                    ConfirmationRequired("upload_files(overwrite)", "将会覆盖多个远端已有文件", file_count=len(files))
-                )
             return await self._run_batch(
                 ctx,
                 connection_handle,
@@ -194,8 +180,10 @@ class TransferTools:
         async def download_files(
             ctx: Context,
             files: Annotated[list[FilePair], Field(description="待下载文件列表，每项包含 remote_path 与 local_path。")],
-            overwrite: Annotated[bool, Field(description="本地文件已存在时是否覆盖。默认 false。")] = False,
-            confirm: Annotated[bool, Field(description="overwrite=true 时必须同时传 confirm=true。")] = False,
+            overwrite: Annotated[
+                bool,
+                Field(description="本地文件已存在时覆盖它们。默认 false 对已存在的逐个拒绝；true 即确认全部覆盖（破坏性，需先向用户确认）。"),
+            ] = False,
             resume: Annotated[bool, Field(description="为 true 时从各自的 .part 断点继续传输。默认 true。")] = True,
             verify: Annotated[
                 Literal["size", "sha256", "none"], Field(description="完整性校验方式，默认 size。")
@@ -209,10 +197,6 @@ class TransferTools:
             返回 {results: [{local_path, remote_path, ok, ...}], succeeded, failed}；单个文件失败不影响其余文件。
             Use when 一次需要取回多个远端文件（如一批日志或产物），比逐个调用 download_file 更高效。
             """
-            if overwrite and not confirm:
-                return tool_err(
-                    ConfirmationRequired("download_files(overwrite)", "将会覆盖多个本地已有文件", file_count=len(files))
-                )
             return await self._run_batch(
                 ctx,
                 connection_handle,

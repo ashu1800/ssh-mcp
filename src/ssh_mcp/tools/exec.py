@@ -22,6 +22,61 @@ class ExecTools:
         self._runner = runner
 
         @app.tool(
+            name="start_background_command",
+            title="后台启动长命令",
+            annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+        )
+        async def start_background_command(
+            command: Annotated[str, Field(description="要后台执行的非交互式 shell 命令，例如 apt install -y pkg 或大型迁移脚本。")],
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
+        ) -> CallToolResult:
+            """把长命令脱离会话放到远端后台运行，立即返回 job_id，不受 execute_command 的超时限制。
+            stdout/stderr 落在远端 /tmp 下的文件里；命令继续跑，即使连接断开或本进程重启也不受影响。
+            返回 {job_id, status: "running", output_files}。
+            Use when 命令预计超过 ~1 分钟（包安装、备份、迁移、构建）；启动后用 get_background_command 轮询。
+            """
+            try:
+                return tool_ok(await self._runner.start_background(connection_handle, command))
+            except ToolFailure as exc:
+                return tool_err(exc)
+
+        @app.tool(
+            name="get_background_command",
+            title="查询后台命令状态与输出",
+            annotations={"readOnlyHint": True, "openWorldHint": True},
+        )
+        async def get_background_command(
+            job_id: Annotated[str, Field(description="start_background_command 返回的 job_id，形如 bg-0a1b2c3d4e5f。")],
+            max_output_bytes: Annotated[
+                int | None,
+                Field(description="stdout 尾部最多保留的字节数，默认 256 KiB。"),
+            ] = None,
+            cleanup: Annotated[
+                bool,
+                Field(description="为 true 且命令已结束时删除远端 /tmp 下的输出与 pid 文件。确认不再需要输出后再传。"),
+            ] = False,
+            connection_handle: Annotated[
+                str | None,
+                Field(description="connect 返回的 connection_handle；省略则使用最近一次使用的连接。"),
+            ] = None,
+        ) -> CallToolResult:
+            """查询后台命令：running/finished、退出码（已结束时）、stdout/stderr 的尾部内容。
+            返回 {job_id, status, exit_code?, stdout_bytes, stderr_bytes, stdout_tail, stderr_tail, hint}。
+            Use when start_background_command 之后轮询进度；status=finished 后读取输出，确认后传 cleanup=true 清理。
+            """
+            try:
+                return tool_ok(
+                    await self._runner.get_background(
+                        connection_handle, job_id, max_output_bytes=max_output_bytes, cleanup=cleanup
+                    )
+                )
+            except ToolFailure as exc:
+                return tool_err(exc)
+
+        @app.tool(
             name="execute_command",
             title="在远端服务器执行命令",
             annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},

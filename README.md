@@ -300,17 +300,21 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 
 | 工具 | 用途 | 需 confirm |
 |---|---|---|
-| `list_servers` | 列出可访问服务器（无凭据） | – |
-| `resolve_server` | 返回脱敏连接摘要 | – |
-| `connect` | 建立/复用连接，返回 `connection_handle` | – |
+| `list_servers` | 列出可访问服务器（含本地 `last_used`） | – |
+| `connect` | **一步连接**：`server` 接受 server_id、别名或唯一子串（如 `web-prod`）；省略则重连最近一台；猜错返回 `candidates` | – |
 | `disconnect` | 关闭连接（handle 随之失效） | ✓ |
 | `execute_command` | 执行非交互命令，超时终止远端进程 | – |
-| `upload_file` / `download_file` | 单文件传输 | 覆盖时 ✓ |
-| `upload_files` / `download_files` | 批量传输（并发限流） | 覆盖时 ✓ |
+| `start_background_command` | 长命令脱离会话后台运行，立即返回 `job_id`（需远端 setsid） | – |
+| `get_background_command` | 查询后台命令状态、退出码与输出尾部；`cleanup=true` 清理临时文件 | – |
+| `upload_file` / `download_file` | 单文件传输（`overwrite=true` 即确认覆盖） | – |
+| `upload_files` / `download_files` | 批量传输（并发限流，同上） | – |
 | `list_directory` / `stat_file` | 目录与元信息 | – |
+| `read_file` | 按行读远端文本文件（支持负 offset 从末尾倒数，>8 MiB 拒绝） | – |
+| `write_file` | 整块写远端文本文件（原子落盘） | 覆盖已有文件时 ✓ |
+| `search_files` | 按文件名 glob 递归搜索远端文件 | – |
 | `make_directory` | 建目录（可递归） | – |
 | `remove_path` | 删除文件/空目录（递归需显式） | ✓ |
-| `rename_path` | 重命名/移动 | ✓ |
+| `rename_path` | 重命名/移动（`overwrite=true` 即确认覆盖目标） | ✓ |
 | `change_permissions` | 改权限（八进制） | ✓ |
 | `get_connection_stats` | 连接池与运行计数 | – |
 
@@ -328,6 +332,26 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 | `get_system_overview` | 主机名、内核、发行版、uptime、负载、内存、CPU 数 |
 | `list_processes` | 按 CPU/内存排序的进程列表（批处理版 top） |
 | `list_listening_ports` | 监听端口及占用进程 |
+
+### 两步内连上任意服务器
+
+`connect` 的 `server` 参数直接填用户提到的名字——server_id、别名或唯一子串都可以（如 `connect(server="web-prod")`），
+不需要先 `list_servers`。猜错时错误体带 `candidates` 候选列表，改用后重试即可，全程最多两步。
+`server` 完全省略时重连**最近一次成功连接的服务器**（历史存 `~/.ssh-mcp/history.json`，跨重启持久），
+`list_servers` 的每行也会带 `last_used` 本地最近使用时间。
+
+密钥同样免配置：首次密码登录时本地生成 Ed25519 密钥并写入远端 `authorized_keys`，之后每次连接
+都是公钥直连（`auth_method: "publickey"`），即使服务器改了密码也不受影响。密钥存在
+`~/.ssh-mcp/keys/`，跨进程重启持久。
+
+### 远端文件读写与长任务
+
+- `read_file` 按行看配置和日志（`offset=-100` 直接看末尾），不会像 `cat` 一样撑爆上下文；
+  `write_file` 整块替换或追加，替代在 shell 里拼 heredoc/sed（覆盖先写临时文件再原子重命名）。
+- `search_files` 按文件名 glob 递归找文件（"日志在哪"一步出结果）。
+- 超过 1 分钟的命令（包安装、迁移、构建）用 `start_background_command` 起后台任务：
+  `setsid` 脱离会话，输出落远端 /tmp 文件，断开连接甚至重启本 MCP 进程都不影响；
+  `get_background_command` 轮询状态并取回输出尾部，结束后 `cleanup=true` 清理。
 
 ### 握手并发上限
 

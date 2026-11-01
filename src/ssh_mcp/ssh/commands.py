@@ -458,3 +458,163 @@ class CommandRunner:
         except (asyncssh.Error, OSError, TimeoutError):
             return False
         return "alive" in str(result.stdout)
+
+    # -- background commands ---------------------------------------------------
+
+    async def start_background(
+        self,
+        handle: str | None,
+        command: str,
+    ) -> dict:
+        """Launch ``command`` detached; its output lands in files, not a channel.
+
+        The whole trick is one line of shell: ``setsid`` detaches the process,
+        output redirections capture the streams, and the wrapper's pid written
+        to the marker file doubles as the job id. Nothing is kept in this
+        process, so the job survives disconnects, restarts of this MCP server,
+        and needs no reaper of its own.
+        """
+        validate_remote_path(command, "command")
+        offender = _interactive_reason(command)
+        if offender is not None:
+            raise ToolFailure(
+                "interactive_command_rejected",
+                stage="validate",
+                hint=f"命令里的 `{offender}` 会等待终端输入；后台运行同样需要批处理写法。",
+                retryable=False,
+                command=offender,
+            )
+        try:
+            async with borrow(self._pool, handle) as acquired:
+                conn = acquired.conn
+                if not await self._supports_setsid(conn):
+                    raise ToolFailure(
+                        "background_unsupported",
+                        stage="execute",
+                        hint="远端没有 setsid，无法安全地脱离会话运行后台命令；请改用 nohup 手工执行。",
+                        retryable=False,
+                    )
+                job_id = f"bg-{secrets.token_hex(6)}"
+                out = f"/tmp/.ssh-mcp-{job_id}.out"
+                err = f"/tmp/.ssh-mcp-{job_id}.err"
+                marker = f"/tmp/.ssh-mcp-{job_id}.pid"
+                wrapped = (
+                    f"setsid sh -c {shlex.quote(command)} >{shlex.quote(out)} 2>{shlex.quote(err)}"
+                    f" & echo $! > {shlex.quote(marker)}"
+                )
+                result = await asyncio.wait_for(conn.run(wrapped, check=False), timeout=15)
+                if result.exit_status != 0:
+                    raise ToolFailure(
+                        "background_start_failed",
+                        stage="execute",
+                        hint=f"后台命令启动失败：{str(result.stderr)[:300]}",
+                        retryable=True,
+                    )
+                return {
+                    "job_id": job_id,
+                    "status": "running",
+                    "output_files": {"stdout": out, "stderr": err},
+                    "hint": "用 get_background_command 查询进度；结束后它会取回输出并清理临时文件。",
+                }
+        except ToolFailure:
+            raise
+        except (asyncssh.Error, ConnectionError, OSError, TimeoutError) as exc:
+            raise ToolFailure(
+                "background_start_failed",
+                stage="execute",
+                hint=f"后台命令启动失败（{type(exc).__name__}），请重试。",
+                retryable=True,
+            ) from None
+
+    async def get_background(
+        self,
+        handle: str | None,
+        job_id: str,
+        *,
+        max_output_bytes: int | None = None,
+        cleanup: bool = False,
+    ) -> dict:
+        """Report one background job's status and tail its output files.
+
+        ``cleanup`` removes the marker/output files once the AI has what it
+        needs; finishing without it keeps the files for a later call.
+        """
+        if not job_id.replace("-", "").isalnum() or job_id.count("-") != 1 or not job_id.startswith("bg-"):
+            # The id becomes part of a shell path below; only our own shape passes.
+            raise ToolFailure(
+                "invalid_argument", stage="validate", hint=f"job_id 形如 bg-0a1b2c3d4e5f，收到 {job_id!r}。", retryable=False
+            )
+        cap = max_output_bytes or self._settings.command_max_output_bytes
+        out = f"/tmp/.ssh-mcp-{job_id}.out"
+        err = f"/tmp/.ssh-mcp-{job_id}.err"
+        marker = f"/tmp/.ssh-mcp-{job_id}.pid"
+        try:
+            async with borrow(self._pool, handle) as acquired:
+                conn = acquired.conn
+                probe = (
+                    f"pid=$(cat {shlex.quote(marker)} 2>/dev/null); "
+                    f"if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then echo RUNNING; "
+                    f"else echo DONE; fi; "
+                    f"echo \"exit=$(cat {shlex.quote(marker)}.code 2>/dev/null || echo '')\"; "
+                    f"echo \"out_bytes=$(stat -c %s {shlex.quote(out)} 2>/dev/null || echo 0)\"; "
+                    f"echo \"err_bytes=$(stat -c %s {shlex.quote(err)} 2>/dev/null || echo 0)\""
+                )
+                result = await asyncio.wait_for(conn.run(probe, check=False), timeout=15)
+                lines = str(result.stdout).splitlines()
+                running = "RUNNING" in (lines[0] if lines else "")
+                exit_code: int | None = None
+                out_bytes = err_bytes = 0
+                for line in lines:
+                    if line.startswith("exit="):
+                        try:
+                            exit_code = int(line[5:])
+                        except ValueError:
+                            exit_code = None
+                    elif line.startswith("out_bytes="):
+                        out_bytes = int(line[10:] or 0)
+                    elif line.startswith("err_bytes="):
+                        err_bytes = int(line[11:] or 0)
+                payload: dict = {
+                    "job_id": job_id,
+                    "status": "running" if running else "finished",
+                    "stdout_bytes": out_bytes,
+                    "stderr_bytes": err_bytes,
+                }
+                if not running:
+                    payload["exit_code"] = exit_code
+                tail_budget = max(1024, min(cap, self._settings.command_max_output_bytes))
+                stdout_tail = await self._read_remote_tail(conn, out, tail_budget)
+                stderr_tail = await self._read_remote_tail(conn, err, max(1024, tail_budget // 4))
+                payload["stdout_tail"] = stdout_tail
+                payload["stderr_tail"] = stderr_tail
+                if running:
+                    payload["hint"] = "仍在运行；稍后再次调用查看进度。结束后可再调一次取完整输出。"
+                else:
+                    payload["hint"] = "已结束。stdout_tail/stderr_tail 是文件末尾内容；确认不再需要后传 cleanup=true 删除临时文件。"
+                if cleanup and not running:
+                    await asyncio.wait_for(
+                        conn.run(f"rm -f {shlex.quote(out)} {shlex.quote(err)} {shlex.quote(marker)} {marker}.code", check=False),
+                        timeout=10,
+                    )
+                    payload["cleaned"] = True
+                return payload
+        except ToolFailure:
+            raise
+        except (asyncssh.Error, ConnectionError, OSError, TimeoutError) as exc:
+            raise ToolFailure(
+                "connection_lost",
+                stage="execute",
+                hint=f"查询后台命令失败（{type(exc).__name__}）；后台进程不受影响，请重试。",
+                retryable=True,
+            ) from None
+
+    @staticmethod
+    async def _read_remote_tail(conn: asyncssh.SSHClientConnection, path: str, cap: int) -> str:
+        """Last ``cap`` bytes of a remote file, as text; empty when absent."""
+        result = await asyncio.wait_for(
+            conn.run(f"tail -c {int(cap)} {shlex.quote(path)} 2>/dev/null", check=False), timeout=15
+        )
+        data = result.stdout
+        if isinstance(data, bytes):
+            return data.decode("utf-8", "replace")
+        return str(data)
