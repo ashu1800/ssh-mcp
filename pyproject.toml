@@ -14,6 +14,10 @@ dependencies = [
     "cryptography>=42",
     "httpx2>=2.10.0",
     "pydantic>=2.12",
+    # Imported directly by http_app.py; declared so an mcp dependency change
+    # cannot remove our ASGI stack under our feet.
+    "starlette>=0.27",
+    "uvicorn>=0.31.1",
 ]
 
 [project.optional-dependencies]

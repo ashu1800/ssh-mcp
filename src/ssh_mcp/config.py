@@ -303,12 +303,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         else:
             write_roots = []
 
-    total_raw = src.env("SSH_MCP_SFTP_TOTAL_TIMEOUT")
-    if total_raw is None:
-        toml_total = src.toml("sftp_total_timeout")
-        sftp_total_timeout = float(toml_total) if toml_total not in (None, "", 0, "0") else None
-    else:
-        sftp_total_timeout = float(total_raw) or None
+    # 0（来自 env 或 TOML）表示"不限制总时长"；走 number() 保证非法值和其他
+    # 字段一样得到 ConfigError，而不是裸 ValueError。
+    sftp_total_timeout = src.number("SSH_MCP_SFTP_TOTAL_TIMEOUT", "sftp_total_timeout", 0.0, minimum=0.0) or None
 
     origins_raw = src.env("SSH_MCP_HTTP_ALLOWED_ORIGINS")
     if origins_raw:

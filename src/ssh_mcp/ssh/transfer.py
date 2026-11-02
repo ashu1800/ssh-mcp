@@ -223,7 +223,7 @@ class SftpTransferEngine:
         refresh: RefreshFn | None = None,
     ) -> TransferResult:
         started = time.monotonic()
-        remote_path = validate_remote_path(remote_path)
+        remote_path = validate_remote_path(remote_path, "remote_path")
         if not local_path.is_file():
             raise ToolFailure(
                 "local_file_missing",
@@ -383,7 +383,7 @@ class SftpTransferEngine:
         refresh: RefreshFn | None = None,
     ) -> TransferResult:
         started = time.monotonic()
-        remote_path = validate_remote_path(remote_path)
+        remote_path = validate_remote_path(remote_path, "remote_path")
         if local_path.exists() and not overwrite:
             raise ToolFailure(
                 "local_exists",
@@ -1044,14 +1044,6 @@ def _channel_dead(sftp: asyncssh.SFTPClient) -> bool:
 
 
 # -- module helpers -----------------------------------------------------------
-
-
-def validate_remote_path(path: str) -> str:
-    if not path or not path.strip():
-        raise ToolFailure("invalid_argument", stage="validate", hint="远端路径不能为空。", retryable=False)
-    if "\x00" in path:
-        raise ToolFailure("invalid_argument", stage="validate", hint="远端路径不能包含 NUL 字符。", retryable=False)
-    return path
 
 
 async def _stat_exists(sftp: asyncssh.SFTPClient, path: str) -> bool:

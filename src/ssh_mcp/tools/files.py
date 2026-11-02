@@ -29,14 +29,6 @@ _WRITE_FILE_MAX_BYTES = 2 * 1024 * 1024
 _SEARCH_DIR_BUDGET = 500
 
 
-def validate_remote_path(path: str, field: str = "path") -> str:
-    if not path or not path.strip():
-        raise ToolFailure("invalid_argument", stage="validate", hint=f"{field} 不能为空。", retryable=False)
-    if "\x00" in path:
-        raise ToolFailure("invalid_argument", stage="validate", hint=f"{field} 不能包含 NUL 字符。", retryable=False)
-    return path
-
-
 def _mode_string(permissions: int | None, file_type: str) -> str:
     perms = (permissions or 0) & 0o777
     return f"{file_type}{perms:04o}"
