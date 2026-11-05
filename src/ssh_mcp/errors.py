@@ -21,6 +21,7 @@ NEXT_ACTION_HINTS: dict[str, NextAction] = {
     "connection_lost": "reconnect",
     "server_not_found": "pick_from_candidates_and_retry_connect",
     "server_ambiguous": "pick_from_candidates_and_retry_connect",
+    "ambiguous_ports": "ask_user_then_retry_connect_with_port",
     "path_not_allowed": "fix_arguments_or_change_config",
     "interactive_command_rejected": "rewrite_as_batch_command",
     "command_timeout": "narrow_the_command_or_raise_timeout",

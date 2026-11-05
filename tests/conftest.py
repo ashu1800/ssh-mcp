@@ -161,6 +161,32 @@ def build_credential_blob(token: str, payload: dict) -> dict:
     }
 
 
+def make_credential_item(token: str, *, server_id: int, alias: str, host: str, port: int, username: str, password: str) -> dict:
+    """One list item in the v2 contract shape: plaintext addressing + encrypted blob."""
+    return {
+        "server_id": server_id,
+        "alias": alias,
+        "host": host,
+        "port": port,
+        "encrypted_blob_ref": f"cred-{server_id}-v1",
+        "auth_type": "password",
+        "group_name": "tests",
+        "blob": build_credential_blob(
+            token,
+            {
+                "version": 1,
+                "server_id": server_id,
+                "alias": alias,
+                "host": host,
+                "port": port,
+                "username": username,
+                "auth": {"type": "password"},
+                "password": password,
+            },
+        ),
+    }
+
+
 class FakeCredentialService:
     """In-process HTTP handler that mimics ``GET /api/mcp/credentials``."""
 
@@ -197,26 +223,15 @@ class FakeCredentialService:
 @pytest.fixture
 def fake_service(ssh_server):
     servers = [
-        {
-            "server_id": 1,
-            "alias": "fake-1",
-            "encrypted_blob_ref": "cred-1-v1",
-            "auth_type": "password",
-            "group_name": "tests",
-            "blob": build_credential_blob(
-                TOKEN,
-                {
-                    "version": 1,
-                    "server_id": 1,
-                    "alias": "fake-1",
-                    "host": "127.0.0.1",
-                    "port": ssh_server.port,
-                    "username": USERNAME,
-                    "auth": {"type": "password"},
-                    "password": PASSWORD,
-                },
-            ),
-        }
+        make_credential_item(
+            TOKEN,
+            server_id=1,
+            alias="fake-1",
+            host="127.0.0.1",
+            port=ssh_server.port,
+            username=USERNAME,
+            password=PASSWORD,
+        )
     ]
     return FakeCredentialService(servers)
 

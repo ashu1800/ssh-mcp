@@ -9,7 +9,9 @@ disk.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +28,69 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS = {500, 502, 503, 504}
 # How long a failed fetch is shared before another attempt is allowed.
 _FAILURE_TTL = 10.0
+
+# ``host:port`` where host is a bracketed IPv6 or an IPv4/hostname.
+_HOST_PORT_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):(\d{1,5})$")
+# Bare hostnames: labels of alnum/dot/hyphen (no colons -- those are IPs).
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+
+def _strip_brackets(host: str) -> str:
+    return host[1:-1] if host.startswith("[") and host.endswith("]") else host
+
+
+def _port_of(item: dict[str, Any]) -> int | None:
+    value = item.get("port")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _candidate(item: dict[str, Any]) -> dict[str, Any]:
+    """One candidate row for error ``candidates``: enough to pick, never secrets."""
+    row = {
+        "server_id": str(item.get("server_id")),
+        "alias": item.get("alias"),
+        "host": item.get("host"),
+        "port": _port_of(item),
+        "group_name": item.get("group_name"),
+    }
+    return {k: v for k, v in row.items() if v is not None}
+
+
+def parse_target(reference: str) -> tuple[str, int | None] | None:
+    """Parse an ``IP`` / ``IP:port`` / ``[IPv6]:port`` reference.
+
+    Returns ``(host, port_or_None)``, or None when the string is not
+    address-shaped (then id/alias matching applies as before).
+    """
+    text = reference.strip()
+    if not text:
+        return None
+    match = _HOST_PORT_RE.match(text)
+    if match:
+        host_part, port_text = match.groups()
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            return None
+        host_part = _strip_brackets(host_part)
+        try:
+            ipaddress.ip_address(host_part)
+        except ValueError:
+            if not _HOSTNAME_RE.match(host_part):
+                return None
+        return host_part.casefold(), port
+    if ":" in text:  # bare IPv6, e.g. ::1
+        return text.casefold(), None
+    try:
+        ipaddress.ip_address(text)
+        return text.casefold(), None
+    except ValueError:
+        pass
+    if _HOSTNAME_RE.match(text):
+        return text.casefold(), None
+    return None
 
 
 @dataclass
@@ -75,6 +140,8 @@ class CredentialClient:
                     encrypted_blob_ref=str(item.get("encrypted_blob_ref") or ""),
                     auth_type=item.get("auth_type"),
                     group_name=item.get("group_name"),
+                    host=item.get("host"),
+                    port=_port_of(item),
                 )
             )
         return summaries
@@ -83,32 +150,37 @@ class CredentialClient:
         """Return the decrypted payload for ``server_id``.
 
         ``server_id`` may be the numeric id, the exact alias (case-insensitive),
+        an ``IP`` / ``IP:port`` / ``[IPv6]:port`` address as the user typed it,
         or a substring matching exactly one server -- so an AI client can say
-        ``connect("web-prod")`` without a ``list_servers`` round trip first.
-        Ambiguity and misses return the candidate list so the next attempt is
-        self-correcting.
+        ``connect("10.0.0.7:2222")`` or ``connect("web-prod")`` without a
+        ``list_servers`` round trip first. Ambiguity and misses return the
+        candidate list (with host:port) so the next attempt is self-correcting.
 
         Refreshes the list once when the server is absent from a cached response
         (a server added or re-keyed since the last fetch), then fails.
         """
         started = time.monotonic()
         entry = await self._fetch(refresh=refresh)
-        blob, state = self._resolve(entry, server_id)
+        blob, state, hits = self._resolve(entry, server_id)
         # Only re-download when the answer came from a cache that predates this
         # call; a cache that was cold or expired was fetched just now.
         if blob is None and not refresh and entry.fetched_at < started:
             entry = await self._fetch(refresh=True)
-            blob, state = self._resolve(entry, server_id)
+            blob, state, hits = self._resolve(entry, server_id)
         if blob is None:
-            candidates = [
-                {"server_id": str(item.get("server_id")), "alias": item.get("alias")}
-                for item in entry.servers
-                if isinstance(item, dict)
-            ]
+            candidates = [_candidate(item) for item in hits]
+            if state == "ambiguous_ports":
+                raise CredentialServiceError(
+                    "ambiguous_ports",
+                    f"{server_id} 上有多台服务器（不同 SSH 端口），请让用户从 candidates 选定后"
+                    "以 \"IP:port\" 重试 connect。",
+                    retryable=False,
+                    candidates=candidates,
+                )
             if state == "ambiguous":
                 raise CredentialServiceError(
                     "server_ambiguous",
-                    f"server_id={server_id} 匹配到多台服务器，请改用 candidates 中的准确 server_id 或完整别名。",
+                    f"server_id={server_id} 匹配到多台服务器，请改用 candidates 中的准确 server_id、完整别名或 IP:port。",
                     retryable=False,
                     candidates=candidates,
                 )
@@ -124,11 +196,19 @@ class CredentialClient:
     # -- internals ------------------------------------------------------------
 
     @staticmethod
-    def _resolve(entry: _CacheEntry, server_id: str) -> tuple[dict[str, Any] | None, str]:
-        """Match a server reference against the list; returns ``(blob, state)``.
+    def _resolve(
+        entry: _CacheEntry, server_id: str
+    ) -> tuple[dict[str, Any] | None, str, list[dict[str, Any]]]:
+        """Match a server reference against the list.
 
-        Order: exact server_id, exact alias, unique substring on id/alias.
-        ``state`` is ``ok``, ``ambiguous`` (several hits) or ``missing``.
+        Returns ``(blob, state, hits)``: ``state`` is ``ok``, ``ambiguous``
+        (several hits for one reference), ``ambiguous_ports`` (one host,
+        several ports, no port given) or ``missing``; ``hits`` is the subset
+        the candidates should show (the full list on a miss).
+
+        Order: exact server_id, exact alias, host[:port] addressing, unique
+        substring on id/alias. Host matching silently no-ops against backends
+        that predate the plaintext host/port fields.
         """
         wanted = server_id.strip()
         lowered = wanted.casefold()
@@ -140,12 +220,24 @@ class CredentialClient:
 
         for item in servers:
             if str(item.get("server_id")) == wanted:
-                return blob_of(item), "ok"
+                return blob_of(item), "ok", [item]
         alias_hits = [item for item in servers if str(item.get("alias") or "").casefold() == lowered]
         if len(alias_hits) > 1:
-            return None, "ambiguous"
+            return None, "ambiguous", alias_hits
         if len(alias_hits) == 1:
-            return blob_of(alias_hits[0]), "ok"
+            return blob_of(alias_hits[0]), "ok", alias_hits
+
+        address = parse_target(wanted)
+        if address is not None:
+            host, port = address
+            host_hits = [item for item in servers if str(item.get("host") or "").casefold() == host]
+            if port is not None:
+                host_hits = [item for item in host_hits if _port_of(item) == port]
+            if len(host_hits) == 1:
+                return blob_of(host_hits[0]), "ok", host_hits
+            if len(host_hits) > 1:
+                return None, ("ambiguous_ports" if port is None else "ambiguous"), host_hits
+
         if lowered:
             partial = [
                 item
@@ -154,10 +246,10 @@ class CredentialClient:
                 or lowered in str(item.get("alias") or "").casefold()
             ]
             if len(partial) > 1:
-                return None, "ambiguous"
+                return None, "ambiguous", partial
             if len(partial) == 1:
-                return blob_of(partial[0]), "ok"
-        return None, "missing"
+                return blob_of(partial[0]), "ok", partial
+        return None, "missing", servers
 
     def _cache_valid(self, entry: _CacheEntry | None) -> bool:
         if entry is None:

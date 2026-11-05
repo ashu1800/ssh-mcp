@@ -15,13 +15,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ServerSummary(BaseModel):
-    """One row of ``list_servers`` -- no connection details."""
+    """One row of ``list_servers`` -- addressing metadata, never credentials.
+
+    ``host``/``port`` let an AI connect by IP directly; passwords and key
+    material stay inside the encrypted blob.
+    """
 
     server_id: str
     alias: str
     encrypted_blob_ref: str
     auth_type: str | None = None
     group_name: str | None = None
+    host: str | None = None
+    port: int | None = None
 
 
 class AuthInfo(BaseModel):

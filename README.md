@@ -2,7 +2,7 @@
 
 本地运行的 MCP Server，把 **SSH 远程命令执行**与 **SFTP 文件传输**提供给 AI 客户端（Claude Code、Cursor、通义灵码等）。
 
-服务器清单与连接凭据不手工录入：MCP 调用服务器管理服务的 `GET /api/mcp/credentials`，取得**加密 blob**，用持有的 MCP 密钥经 HKDF-SHA256 派生密钥、AES-256-GCM 解密后，在本进程内完成全部 SSH/SFTP 操作。
+服务器清单与连接凭据不手工录入：MCP 调用服务器管理服务的 `GET /api/mcp/credentials`，取得**加密 blob**（密码/私钥只存在于密文），用持有的 MCP 密钥经 HKDF-SHA256 派生密钥、AES-256-GCM 解密后，在本进程内完成全部 SSH/SFTP 操作。清单同时明文携带 `host`/`port` 寻址元数据，因此 AI 直接把用户给的 IP 传给 `connect` 即可，无需先解密或查列表。
 
 - 传输：**stdio**（默认）与 **Streamable HTTP**（无状态，协议版本 `2026-07-28`）
 - 认证：首次密码登录 → 本地生成 Ed25519 密钥 → 写入远端 `authorized_keys` → 后续公钥登录
@@ -165,8 +165,12 @@ claude mcp add -s user ssh -e MCP_KEY=mcp_xxx -- ssh-mcp --transport stdio
 包版本号在两次提交之间不变，所以普通 `pip install` 会把现有安装视为已满足并**跳过**。更新必须显式强制：
 
 ```bash
-python scripts/install.py --mcp-key mcp_xxx --update
+python scripts/install.py --update            # 密钥自动复用已装配置里的，无需再带 --mcp-key
+python scripts/install.py --update --mcp-key mcp_xxx   # 换密钥时才显式传
 ```
+
+首次安装必须 `--mcp-key`；之后的更新省略它时，脚本会按 `~/.claude.json` → 各客户端配置文件的顺序
+找回已安装的密钥（报告行会标注 `reused from <文件>`，密钥只显示前 6 后 4 位）。
 
 `--update` 会 `--force-reinstall --no-deps` 重装当前提交的代码，然后照常重写客户端配置。只想重装包、不动配置时：
 
@@ -300,8 +304,8 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 
 | 工具 | 用途 | 需 confirm |
 |---|---|---|
-| `list_servers` | 列出可访问服务器（含本地 `last_used`） | – |
-| `connect` | **一步连接**：`server` 接受 server_id、别名或唯一子串（如 `web-prod`）；省略则重连最近一台；猜错返回 `candidates` | – |
+| `list_servers` | 列出可访问服务器（含 `host`/`port` 与本地 `last_used`；不含凭据） | – |
+| `connect` | **一步连接**：`server` 直接接受 IP、`IP:port`、server_id、别名或唯一子串；同 IP 多端口未指定端口时返回 `ambiguous_ports` 候选；省略则重连最近一台 | – |
 | `disconnect` | 关闭连接（handle 随之失效） | ✓ |
 | `execute_command` | 执行非交互命令，超时终止远端进程 | – |
 | `start_background_command` | 长命令脱离会话后台运行，立即返回 `job_id`（需远端 setsid） | – |
@@ -333,10 +337,12 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 | `list_processes` | 按 CPU/内存排序的进程列表（批处理版 top） |
 | `list_listening_ports` | 监听端口及占用进程 |
 
-### 两步内连上任意服务器
+### 一步连上任意服务器
 
-`connect` 的 `server` 参数直接填用户提到的名字——server_id、别名或唯一子串都可以（如 `connect(server="web-prod")`），
-不需要先 `list_servers`。猜错时错误体带 `candidates` 候选列表，改用后重试即可，全程最多两步。
+`connect` 的 `server` 参数**直接填用户给的地址或名字**：`10.0.0.7`、`10.0.0.7:2222`、`[::1]:22`、
+server_id、别名或唯一子串都可以，不需要先 `list_servers`。猜错时错误体带 `candidates`
+候选列表（含 `host:port`），改用后重试即可。用户只给 IP 而该 IP 挂了多个 SSH 端口时，
+返回 `ambiguous_ports` 与带端口的候选，选定 `IP:port` 重试即连上。
 `server` 完全省略时重连**最近一次成功连接的服务器**（历史存 `~/.ssh-mcp/history.json`，跨重启持久），
 `list_servers` 的每行也会带 `last_used` 本地最近使用时间。
 
