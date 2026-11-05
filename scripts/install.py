@@ -810,12 +810,74 @@ def wire_claude_code(
 # -- main ---------------------------------------------------------------------
 
 
+def _find_env_key(node: Any) -> str | None:
+    """Recursively locate ``env.MCP_KEY`` in a parsed JSON client config."""
+    if isinstance(node, dict):
+        env = node.get("env")
+        if isinstance(env, dict):
+            value = env.get("MCP_KEY")
+            if isinstance(value, str) and value.startswith("mcp_"):
+                return value
+        for value in node.values():
+            found = _find_env_key(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_env_key(value)
+            if found:
+                return found
+    return None
+
+
+_DSH_KEY_RE = re.compile(r"MCP_KEY:\s*(?:\"(mcp_[^\"]+)\"|(mcp_\S+))")
+
+
+def _extract_mcp_key(path: Path) -> str | None:
+    """The installed MCP_KEY in one client config file, or None."""
+    if path.suffix == ".json":
+        return _find_env_key(_load_json(path))
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _DSH_KEY_RE.search(raw)
+    return next(group for group in match.groups() if group) if match else None
+
+
+def _existing_mcp_key() -> tuple[str, str] | None:
+    """Reuse an already-installed key so updates need no --mcp-key.
+
+    Scans every client config the installer knows about; the first entry wins
+    (all clients share the user's key in practice). ``claude mcp add`` also
+    stores its result in ``~/.claude.json``, so the CLI path is covered too.
+    """
+    paths: list[Path] = [_home() / ".claude.json"]
+    paths += [spec.file for spec in _client_specs()]
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        key = _extract_mcp_key(path)
+        if key:
+            return key, str(path)
+    return None
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="install.py",
         description="Install ssh-mcp and register it with local MCP clients.",
     )
-    parser.add_argument("--mcp-key", required=True, help="MCP key issued by the server management service")
+    parser.add_argument(
+        "--mcp-key",
+        default=None,
+        help=(
+            "MCP key issued by the server management service. Required on first install; "
+            "omit on updates to reuse the key already present in installed client configs"
+        ),
+    )
     parser.add_argument(
         "--venv",
         default=None,
@@ -859,7 +921,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if not args.mcp_key.startswith("mcp_"):
+    key_source = "set in client config, not written to logs"
+    if args.mcp_key is None:
+        found = _existing_mcp_key()
+        if found is None:
+            raise SystemExit(
+                "--mcp-key is required on first install; later runs may omit it to reuse "
+                "the key found in installed client configs (none found here)"
+            )
+        args.mcp_key, key_source = found
+        key_source = f"reused from {key_source}"
+    elif not args.mcp_key.startswith("mcp_"):
         raise SystemExit("--mcp-key does not look like an MCP token (expected a 'mcp_' prefix)")
 
     repo = Path(__file__).resolve().parent.parent
@@ -903,7 +975,7 @@ def main(argv: list[str] | None = None) -> int:
     # -- report ---------------------------------------------------------------
     print()
     print(f"command : {result.command}  ({result.command_source})")
-    print(f"mcp key : {args.mcp_key[:6]}***{args.mcp_key[-4:]}  (set in client config, not written to logs)")
+    print(f"mcp key : {args.mcp_key[:6]}***{args.mcp_key[-4:]}  ({key_source})")
     print()
     for client in result.clients:
         if client.changed:
