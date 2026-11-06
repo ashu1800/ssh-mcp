@@ -14,7 +14,7 @@ What it does, in order:
    running interpreter's environment, verifying ``ssh-mcp --help`` afterwards.
 2. Writes the server entry into every client config it can find:
    Claude Code (``claude mcp add`` if the CLI exists, else ``~/.claude.json``),
-   Claude Desktop, Cursor, and VS Code / 通义灵码 style ``mcp.json`` files.
+   Claude Desktop, Cursor, Pi, and VS Code / 通义灵码 style ``mcp.json`` files.
 3. Rewrites existing files atomically and keeps a ``.bak`` copy first.
 
 The MCP key is never printed. Use ``--dry-run`` to see which files would change.
@@ -34,6 +34,10 @@ from pathlib import Path
 from typing import Any
 
 SERVER_NAME = "ssh"
+# Config keys and command lines that mean "this server". Used to pick our own
+# MCP_KEY out of a file that also holds sibling installs.
+_OUR_ENTRY_KEYS = {SERVER_NAME, "ssh-mcp", "ssh_mcp"}
+_OUR_COMMAND_HINTS = ("ssh_mcp", "ssh-mcp")
 PACKAGE_URL = "git+https://github.com/ashu1800/ssh-mcp.git"
 
 
@@ -47,6 +51,9 @@ class ClientTarget:
     exists: bool = False
     changed: bool = False
     note: str = ""
+    # Keys merged into the server entry for this client only (Pi reads
+    # ``description``, which other clients would just ignore).
+    entry_extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -177,7 +184,7 @@ def _close_clients_hint() -> str:
     if _running_ssh_mcp():
         return (
             "ssh-mcp is running right now. Quit the MCP client that started it (Claude Code, DSH, "
-            "Cursor, ...) -- or stop the server from its MCP settings -- and run this again."
+            "Cursor, Pi, ...) -- or stop the server from its MCP settings -- and run this again."
         )
     return (
         "A process is holding ssh-mcp's files. Quit every MCP client that has this server enabled "
@@ -295,6 +302,12 @@ def _home() -> Path:
     return Path.home()
 
 
+def _pi_config_dir() -> Path:
+    """Pi's config directory: ``PI_CODING_AGENT_DIR`` wins, else ``~/.pi/agent``."""
+    override = os.environ.get("PI_CODING_AGENT_DIR")
+    return Path(override).expanduser() if override else _home() / ".pi/agent"
+
+
 def desktop_config_paths() -> dict[str, Path]:
     """Claude Desktop config files, standard build first, then the 3p build."""
     home = _home()
@@ -351,6 +364,9 @@ class ClientSpec:
     binaries: tuple[str, ...] = ()
     # Whether a missing config may be created (vs. only updated when present).
     create: bool = True
+    # Client-specific keys written into the entry; a tuple keeps the frozen
+    # dataclass hashable, unlike a dict default.
+    entry_extra: tuple[tuple[str, Any], ...] = ()
 
 
 def _client_specs() -> list[ClientSpec]:
@@ -377,6 +393,22 @@ def _client_specs() -> list[ClientSpec]:
 
     specs.append(
         ClientSpec("Cursor", home / ".cursor/mcp.json", "mcp-json", markers=(home / ".cursor",), binaries=("cursor",))
+    )
+
+    # Pi keeps user-level servers in its agent directory and project servers in
+    # ``.pi/mcp.json``; the user-level file is the one that applies everywhere.
+    # The entry carries ``description`` -- Pi lists it in the system prompt and
+    # ranks the server's tools by it -- which the other clients ignore.
+    pi_config_dir = _pi_config_dir()
+    specs.append(
+        ClientSpec(
+            "Pi",
+            pi_config_dir / "mcp.json",
+            "mcp-json",
+            markers=(pi_config_dir,),
+            binaries=("pi",),
+            entry_extra=(("description", "SSH remote command execution and SFTP file transfer"),),
+        )
     )
 
     vscode = (
@@ -476,7 +508,7 @@ def discover_clients() -> list[ClientTarget]:
             or any(marker.is_dir() and any(marker.iterdir()) for marker in spec.markers)
             or any(shutil.which(binary) for binary in spec.binaries)
         )
-        target = ClientTarget(spec.label, spec.file, spec.format)
+        target = ClientTarget(spec.label, spec.file, spec.format, entry_extra=dict(spec.entry_extra))
         if not installed:
             target.note = "client not installed"
         candidates.append(target)
@@ -549,6 +581,7 @@ def wire_file(target: ClientTarget, entry: dict[str, Any], *, dry_run: bool) -> 
         return
 
     data = _load_json(target.path)
+    entry = {**target.entry_extra, **entry}
     if target.kind == "vscode-json":
         # VS Code's schema keys servers under "servers" and requires a type.
         servers = data.setdefault("servers", {})
@@ -810,12 +843,111 @@ def wire_claude_code(
 # -- main ---------------------------------------------------------------------
 
 
+def _entry_runs_this_server(entry: dict[str, Any]) -> bool:
+    """Whether a config entry's command line actually starts ssh-mcp."""
+    argv: list[Any] = [entry.get("command")]
+    args = entry.get("args")
+    if isinstance(args, list):
+        argv.extend(args)
+    text = " ".join(str(part) for part in argv if isinstance(part, str)).replace("\\", "/")
+    return any(hint in text.casefold() for hint in _OUR_COMMAND_HINTS)
+
+
+def _find_env_key(node: Any, *, owned: bool = False) -> str | None:
+    """Locate ``env.MCP_KEY`` for *this* server, not whichever comes first.
+
+    ``~/.claude.json`` holds one entry per MCP server, so a blind search happily
+    returns a sibling install's key (``panel-mcp-ssh``, another project) and the
+    installer then writes it into every client, where auth fails with
+    ``mcp_key_invalid``. An entry counts as ours when its config key is our
+    server name or when its command line starts this server.
+    """
+    if isinstance(node, dict):
+        env = node.get("env")
+        if isinstance(env, dict) and (owned or _entry_runs_this_server(node)):
+            value = env.get("MCP_KEY")
+            if isinstance(value, str) and value.startswith("mcp_"):
+                return value
+        for key, value in node.items():
+            found = _find_env_key(value, owned=isinstance(key, str) and key in _OUR_ENTRY_KEYS)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_env_key(value)
+            if found:
+                return found
+    return None
+
+
+# ``MCP_KEY: 'mcp_x'`` must yield ``mcp_x``: the old pattern's ``\S+`` branch
+# captured the quotes and wrote them into env.MCP_KEY of every client.
+_DSH_KEY_RE = re.compile(r"""MCP_KEY:\s*(?:"(mcp_[^"]+)"|'(mcp_[^']+)'|(mcp_\S+))""")
+
+
+def _extract_mcp_key(path: Path) -> str | None:
+    """The installed MCP_KEY in one client config file, or None."""
+    if path.suffix == ".json":
+        try:
+            return _find_env_key(_load_json(path))
+        except SystemExit:
+            # A corrupt config for a client we are not even touching must not
+            # abort the install before it writes anything.
+            return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    match = _DSH_KEY_RE.search(raw)
+    value = next((group for group in match.groups() if group), None) if match else None
+    return value.strip("'\"") if value else None
+
+
+def _existing_mcp_key() -> tuple[str, str] | None:
+    """Reuse an already-installed key so updates need no --mcp-key.
+
+    Scans every client config the installer knows about; the first entry that
+    belongs to this server wins (all our clients share the same key).
+    ``claude mcp add`` also stores its result in ``~/.claude.json``, so the CLI
+    path is covered too.
+    """
+    paths: list[Path] = [_home() / ".claude.json"]
+    paths += [spec.file for spec in _client_specs()]
+    seen: set[Path] = set()
+    found: dict[str, str] = {}
+    for path in paths:
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        key = _extract_mcp_key(path)
+        if key:
+            found.setdefault(key, str(path))
+    if not found:
+        return None
+    if len(found) > 1:
+        # Never print the keys themselves: this output ends up in pasted logs.
+        sources = list(found.values())
+        print(
+            f"warning: configs disagree on MCP_KEY ({', '.join(sources)}); "
+            f"reusing the one in {sources[0]}",
+            file=sys.stderr,
+        )
+    return next(iter(found.items()))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="install.py",
         description="Install ssh-mcp and register it with local MCP clients.",
     )
-    parser.add_argument("--mcp-key", required=True, help="MCP key issued by the server management service")
+    parser.add_argument(
+        "--mcp-key",
+        default=None,
+        help=(
+            "MCP key issued by the server management service. Required on first install; "
+            "omit on updates to reuse the key already present in installed client configs"
+        ),
+    )
     parser.add_argument(
         "--venv",
         default=None,
@@ -843,7 +975,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--clients",
         default="all",
         help=(
-            "comma-separated substrings matched against client labels, e.g. claude,cursor,vscode,"
+            "comma-separated substrings matched against client labels, e.g. claude,cursor,pi,vscode,"
             "windsurf,trae,qoder,workbuddy,zcode,dsh (default: all)"
         ),
     )
@@ -859,7 +991,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if not args.mcp_key.startswith("mcp_"):
+    key_source = "set in client config, not written to logs"
+    if args.mcp_key is None:
+        found = _existing_mcp_key()
+        if found is None:
+            raise SystemExit(
+                "--mcp-key is required on first install; later runs may omit it to reuse "
+                "the key found in installed client configs (none found here)"
+            )
+        args.mcp_key, key_source = found
+        key_source = f"reused from {key_source}"
+    elif not args.mcp_key.startswith("mcp_"):
         raise SystemExit("--mcp-key does not look like an MCP token (expected a 'mcp_' prefix)")
 
     repo = Path(__file__).resolve().parent.parent
@@ -903,7 +1045,7 @@ def main(argv: list[str] | None = None) -> int:
     # -- report ---------------------------------------------------------------
     print()
     print(f"command : {result.command}  ({result.command_source})")
-    print(f"mcp key : {args.mcp_key[:6]}***{args.mcp_key[-4:]}  (set in client config, not written to logs)")
+    print(f"mcp key : {args.mcp_key[:6]}***{args.mcp_key[-4:]}  ({key_source})")
     print()
     for client in result.clients:
         if client.changed:

@@ -346,3 +346,60 @@ def test_zcode_spec_exists_even_before_the_client_runs(installer, monkeypatch, t
     assert spec.format == "zcode-json"
     assert spec.binaries == ("zcode",)
     assert spec.file not in spec.markers, "the config being present is already checked separately"
+
+
+# -- Pi -----------------------------------------------------------------------
+
+
+def _spec(installer, label: str, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setattr(installer, "_home", lambda: home)
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    return next(spec for spec in installer._client_specs() if spec.label == label)
+
+
+def test_pi_spec_points_at_the_user_level_mcp_json(installer, monkeypatch, tmp_path):
+    spec = _spec(installer, "Pi", monkeypatch, tmp_path)
+
+    assert spec.file == tmp_path / "home" / ".pi/agent/mcp.json"
+    assert spec.format == "mcp-json"
+    assert spec.binaries == ("pi",)
+
+
+def test_pi_spec_follows_the_agent_dir_override(installer, monkeypatch, tmp_path):
+    """Pi honours PI_CODING_AGENT_DIR, so the installer must too."""
+    custom = tmp_path / "elsewhere"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(custom))
+    monkeypatch.setattr(installer, "_home", lambda: tmp_path / "home")
+
+    spec = next(spec for spec in installer._client_specs() if spec.label == "Pi")
+
+    assert spec.file == custom / "mcp.json"
+    assert custom in spec.markers
+
+
+def test_pi_writer_adds_the_description_pi_ranks_tools_by(installer, monkeypatch, tmp_path):
+    """Pi reads ``description`` into its system prompt; the other clients do not."""
+    spec = _spec(installer, "Pi", monkeypatch, tmp_path)
+    config = tmp_path / "mcp.json"
+    target = installer.ClientTarget(spec.label, config, spec.format, entry_extra=dict(spec.entry_extra))
+
+    installer.wire_file(target, ENTRY, dry_run=False)
+
+    server = json.loads(config.read_text(encoding="utf-8"))["mcpServers"]["ssh"]
+    assert server["command"] == ENTRY["command"]
+    assert server["args"] == ENTRY["args"]
+    assert server["env"] == ENTRY["env"]
+    assert "SSH" in server["description"]
+
+    again = installer.ClientTarget(spec.label, config, spec.format, entry_extra=dict(spec.entry_extra))
+    installer.wire_file(again, ENTRY, dry_run=False)
+    assert again.changed is False
+
+
+def test_only_pi_carries_client_specific_entry_keys(installer, monkeypatch, tmp_path):
+    """Claude/Cursor configs must stay exactly the shape those clients document."""
+    cursor = _spec(installer, "Cursor", monkeypatch, tmp_path)
+
+    assert cursor.entry_extra == ()
