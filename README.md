@@ -1,6 +1,6 @@
 # ssh-mcp
 
-本地运行的 MCP Server，把 **SSH 远程命令执行**与 **SFTP 文件传输**提供给 AI 客户端（Claude Code、Cursor、通义灵码等）。
+本地运行的 MCP Server，把 **SSH 远程命令执行**与 **SFTP 文件传输**提供给 AI 客户端（Claude Code、Cursor、Pi、通义灵码等）。
 
 服务器清单与连接凭据不手工录入：MCP 调用服务器管理服务的 `GET /api/mcp/credentials`，取得**加密 blob**（密码/私钥只存在于密文），用持有的 MCP 密钥经 HKDF-SHA256 派生密钥、AES-256-GCM 解密后，在本进程内完成全部 SSH/SFTP 操作。清单同时明文携带 `host`/`port` 寻址元数据，因此 AI 直接把用户给的 IP 传给 `connect` 即可，无需先解密或查列表。
 
@@ -100,6 +100,7 @@ python scripts/install.py --mcp-key mcp_xxx
 - **Claude Code**：优先调用 `claude mcp add -s user`，没有 CLI 时改 `~/.claude.json`
 - **Claude Desktop**：标准版 `%APPDATA%\Claude`，3p 版 `%LOCALAPPDATA%\Claude-3p`
 - **Cursor**：`~/.cursor/mcp.json`
+- **Pi**：`~/.pi/agent/mcp.json`（认 `PI_CODING_AGENT_DIR`；条目额外带 `description`，Pi 用它把服务器写进系统提示）
 - **VS Code / 通义灵码**：`%APPDATA%\Code\User\mcp.json`（`servers` 键）
 - **Windsurf**：`~/.codeium/windsurf/mcp_config.json`
 - **Trae / Qoder**：`%APPDATA%\<App>\User\mcp.json`
@@ -135,7 +136,7 @@ DSH 的桌面端与 Web 端是两套独立的 profile 根，各自从 `profiles/
 重复运行只替换 `panel-mcp-ssh` 这一条。`~/.dsh/skill-mcp-manager/registry.json` 是面板根据这些行
 生成的缓存，不需要单独写。DSH 的 HMR 会热加载改动，桌面端若没反应重启一次即可。
 
-`--dry-run` 只报告会改哪些文件；`--skip-install` 只写配置；`--clients claude,cursor` 限定目标；
+`--dry-run` 只报告会改哪些文件；`--skip-install` 只写配置；`--clients claude,cursor,pi` 限定目标；
 `--from-wheel dist/xxx.whl` 在离线机器上安装。改动前会留 `.bak`，检测不到客户端的配置不会被创建。
 
 ### 不 clone 仓库的安装方式
@@ -179,7 +180,7 @@ pip install --force-reinstall --no-deps "git+https://github.com/ashu1800/ssh-mcp
 ```
 
 已用 venv 安装的机器（`install.py` 默认），更新也会装回同一个 venv；用 `pip install --user` 装的机器用上面的 pip 命令即可。
-更新后需要重启客户端（Desktop/Cursor 重启应用，Claude Code 新开会话）才会加载新进程。
+更新后需要重启客户端（Desktop/Cursor 重启应用，Claude Code 新开会话，Pi 用 `/reload`）才会加载新进程。
 
 ### 客户端正在运行时更新
 
@@ -247,6 +248,43 @@ HTTP（多客户端共享）：
 ```
 
 Cursor 目前走 `initialize` 握手（协议 `2025-11-25`），由同一个 SDK 处理，工具行为一致。
+
+### Pi
+
+Pi 的用户级配置是 `~/.pi/agent/mcp.json`，条目形态与 Claude / Cursor 一致，只多一个可选的
+`description` —— Pi 用它把服务器列进系统提示，并据此给该服务器的工具排序（其它客户端会忽略这个键）：
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "description": "SSH remote command execution and SFTP file transfer",
+      "command": "python",
+      "args": ["-m", "ssh_mcp", "--transport", "stdio"],
+      "env": { "MCP_KEY": "mcp_xxx" }
+    }
+  }
+}
+```
+
+也可以让 Pi 自己写这条配置，再确认连接：
+
+```bash
+pi mcp add ssh --env MCP_KEY=mcp_xxx -- ssh-mcp --transport stdio
+pi mcp list
+```
+
+会话里的 `/mcp` 能看到连接状态、工具数量、暴露方式，也能重连、登录、启停；在 Pi 外面改完配置用
+`/reload` 重新加载。Pi 会把工具名改写成 `mcp__ssh__<tool>`，因此 `--tools 'mcp__ssh__*'`
+（或 `--exclude-tools`）可以把它和其它工具的取舍写进命令行。
+
+Pi 默认给 MCP 服务器的 `exposure` 是 `codemode`：这 27 个工具不会全部塞进工具定义，模型在 codemode
+脚本里按需检索调用，系统提示中只占一行服务器摘要。要让它像内置工具一样直接可见，加
+`"exposure": "direct"`（工具集小时才划算），交给 `tool_search` 按需拉出来用 `"deferred"`，
+也可以用 `toolExposure` 按名字或通配符逐个指定。
+
+Pi 也读项目级 `.pi/mcp.json`（需项目信任），同名条目覆盖用户级 —— 想把服务器配置随仓库分发时用它。
+配置目录可用 `PI_CODING_AGENT_DIR` 覆盖，`install.py` 认这个变量。
 
 ### 通义灵码
 

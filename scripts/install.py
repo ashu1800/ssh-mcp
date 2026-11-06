@@ -14,7 +14,7 @@ What it does, in order:
    running interpreter's environment, verifying ``ssh-mcp --help`` afterwards.
 2. Writes the server entry into every client config it can find:
    Claude Code (``claude mcp add`` if the CLI exists, else ``~/.claude.json``),
-   Claude Desktop, Cursor, and VS Code / 通义灵码 style ``mcp.json`` files.
+   Claude Desktop, Cursor, Pi, and VS Code / 通义灵码 style ``mcp.json`` files.
 3. Rewrites existing files atomically and keeps a ``.bak`` copy first.
 
 The MCP key is never printed. Use ``--dry-run`` to see which files would change.
@@ -47,6 +47,9 @@ class ClientTarget:
     exists: bool = False
     changed: bool = False
     note: str = ""
+    # Keys merged into the server entry for this client only (Pi reads
+    # ``description``, which other clients would just ignore).
+    entry_extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -177,7 +180,7 @@ def _close_clients_hint() -> str:
     if _running_ssh_mcp():
         return (
             "ssh-mcp is running right now. Quit the MCP client that started it (Claude Code, DSH, "
-            "Cursor, ...) -- or stop the server from its MCP settings -- and run this again."
+            "Cursor, Pi, ...) -- or stop the server from its MCP settings -- and run this again."
         )
     return (
         "A process is holding ssh-mcp's files. Quit every MCP client that has this server enabled "
@@ -295,6 +298,12 @@ def _home() -> Path:
     return Path.home()
 
 
+def _pi_config_dir() -> Path:
+    """Pi's config directory: ``PI_CODING_AGENT_DIR`` wins, else ``~/.pi/agent``."""
+    override = os.environ.get("PI_CODING_AGENT_DIR")
+    return Path(override).expanduser() if override else _home() / ".pi/agent"
+
+
 def desktop_config_paths() -> dict[str, Path]:
     """Claude Desktop config files, standard build first, then the 3p build."""
     home = _home()
@@ -351,6 +360,9 @@ class ClientSpec:
     binaries: tuple[str, ...] = ()
     # Whether a missing config may be created (vs. only updated when present).
     create: bool = True
+    # Client-specific keys written into the entry; a tuple keeps the frozen
+    # dataclass hashable, unlike a dict default.
+    entry_extra: tuple[tuple[str, Any], ...] = ()
 
 
 def _client_specs() -> list[ClientSpec]:
@@ -377,6 +389,22 @@ def _client_specs() -> list[ClientSpec]:
 
     specs.append(
         ClientSpec("Cursor", home / ".cursor/mcp.json", "mcp-json", markers=(home / ".cursor",), binaries=("cursor",))
+    )
+
+    # Pi keeps user-level servers in its agent directory and project servers in
+    # ``.pi/mcp.json``; the user-level file is the one that applies everywhere.
+    # The entry carries ``description`` -- Pi lists it in the system prompt and
+    # ranks the server's tools by it -- which the other clients ignore.
+    pi_config_dir = _pi_config_dir()
+    specs.append(
+        ClientSpec(
+            "Pi",
+            pi_config_dir / "mcp.json",
+            "mcp-json",
+            markers=(pi_config_dir,),
+            binaries=("pi",),
+            entry_extra=(("description", "SSH remote command execution and SFTP file transfer"),),
+        )
     )
 
     vscode = (
@@ -476,7 +504,7 @@ def discover_clients() -> list[ClientTarget]:
             or any(marker.is_dir() and any(marker.iterdir()) for marker in spec.markers)
             or any(shutil.which(binary) for binary in spec.binaries)
         )
-        target = ClientTarget(spec.label, spec.file, spec.format)
+        target = ClientTarget(spec.label, spec.file, spec.format, entry_extra=dict(spec.entry_extra))
         if not installed:
             target.note = "client not installed"
         candidates.append(target)
@@ -549,6 +577,7 @@ def wire_file(target: ClientTarget, entry: dict[str, Any], *, dry_run: bool) -> 
         return
 
     data = _load_json(target.path)
+    entry = {**target.entry_extra, **entry}
     if target.kind == "vscode-json":
         # VS Code's schema keys servers under "servers" and requires a type.
         servers = data.setdefault("servers", {})
@@ -905,7 +934,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--clients",
         default="all",
         help=(
-            "comma-separated substrings matched against client labels, e.g. claude,cursor,vscode,"
+            "comma-separated substrings matched against client labels, e.g. claude,cursor,pi,vscode,"
             "windsurf,trae,qoder,workbuddy,zcode,dsh (default: all)"
         ),
     )
