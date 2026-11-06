@@ -49,9 +49,11 @@ async def test_list_servers(app):
     assert is_error is False
     assert payload["total"] == 1
     row = payload["servers"][0]
-    assert set(row) == {"server_id", "alias", "encrypted_blob_ref", "auth_type", "group_name", "last_used"}
+    assert set(row) == {"server_id", "alias", "encrypted_blob_ref", "auth_type", "group_name", "host", "port", "last_used"}
+    assert row["host"] == "127.0.0.1"  # v2 contract: addressing metadata is plaintext
     assert row["last_used"] is None
     assert PASSWORD not in json.dumps(payload)
+    assert USERNAME not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
@@ -64,6 +66,39 @@ async def test_connect_result_is_redacted(app, ssh_server):
     assert payload["username"] == USERNAME
     rendered = json.dumps(payload)
     assert PASSWORD not in rendered
+
+
+@pytest.mark.asyncio
+async def test_connect_by_ip_one_step(app, ssh_server):
+    """User hands only the IP: connect resolves and dials without list_servers."""
+    payload, is_error = await call(app, "connect", server="127.0.0.1")
+    assert is_error is False
+    assert payload["host"] == "127.0.0.1"
+    assert payload["port"] == ssh_server.port
+    payload, is_error = await call(app, "connect", server=f"127.0.0.1:{ssh_server.port}")
+    assert is_error is False
+
+
+@pytest.mark.asyncio
+async def test_connect_by_ip_offers_ports_when_ambiguous(app, settings, fake_service, ssh_server):
+    """Two servers share the IP: bare-IP connect must answer ambiguous_ports."""
+    from tests.conftest import make_credential_item
+
+    fake_service._servers.append(
+        make_credential_item(
+            settings.mcp_key,
+            server_id=2,
+            alias="fake-2",
+            host="127.0.0.1",
+            port=ssh_server.port + 1,
+            username=USERNAME,
+            password=PASSWORD,
+        )
+    )
+    payload, is_error = await call(app, "connect", server="127.0.0.1")
+    assert is_error is True
+    assert payload["error"] == "ambiguous_ports"
+    assert sorted(c["port"] for c in payload["candidates"]) == sorted([ssh_server.port, ssh_server.port + 1])
 
 
 @pytest.mark.asyncio

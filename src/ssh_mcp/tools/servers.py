@@ -37,10 +37,10 @@ class ServerTools:
                 Field(description="为 true 时绕过短时缓存，立即向服务器管理服务重新拉取列表。默认 false。"),
             ] = False,
         ) -> CallToolResult:
-            """列出当前 MCP 密钥可访问的 SSH 服务器，返回 server_id、别名和加密凭据引用，不包含任何明文连接信息。
-            返回 {servers: [{server_id, alias, encrypted_blob_ref, auth_type, group_name, last_used}], total, cached}。
+            """列出当前 MCP 密钥可访问的 SSH 服务器，返回 server_id、别名、host:port 与加密凭据引用，不包含任何凭据（密码/私钥）。
+            返回 {servers: [{server_id, alias, host, port, encrypted_blob_ref, auth_type, group_name, last_used}], total, cached}。
             last_used 是本地记录的最近一次成功连接时间（Unix 秒），没有记录时为 null。
-            Use when 用户提到某台机器但你还不知道 server_id，或需要确认可操作范围时先调用本工具。
+            Use when 需要纵览可操作的服务器清单（按 IP 直连不需要本工具，直接把 IP 传给 connect 即可）。
             """
             try:
                 servers = await self._credentials.list_servers(refresh=refresh)
@@ -70,7 +70,9 @@ class ServerTools:
                 str | None,
                 Field(
                     description=(
-                        "server_id、服务器别名（如 web-prod）或唯一匹配的子串。"
+                        "用户给的地址或名字均可：IP（如 10.0.0.7）、IP:port（如 10.0.0.7:2222）、"
+                        "[IPv6]:port、server_id、别名（如 web-prod）或唯一匹配的子串。"
+                        "同 IP 多端口且未指定端口时返回 ambiguous_ports 候选（含各端口）供选择。"
                         "省略时连接最近一次成功连接的服务器（跨重启持久）。"
                         "不确定时可直接尝试；猜错会返回 candidates 候选列表供纠正。"
                     )
@@ -82,7 +84,8 @@ class ServerTools:
             ] = None,
         ) -> CallToolResult:
             """对指定服务器建立（或复用）SSH 连接，返回 connection_handle 供后续命令执行与 SFTP 工具使用。
-            一步即可连接：server 直接填用户提到的名字或 ID，无需先调用 list_servers；
+            一步即可连接：server 直接填用户给的 IP、IP:port、名字或 ID，无需先调用 list_servers；
+            同 IP 存在多台（不同端口）且只给了 IP 时返回 ambiguous_ports 与带端口候选，选定后重试。
             省略 server 则重连最近一次用的服务器（0 参数）。首次密码登录时会生成本地 Ed25519 密钥并把公钥
             写入远端 authorized_keys，之后再连自动公钥直连、无需密码。
             Use when 需要在该服务器上执行命令或传输文件之前；同一服务器重复调用会复用同一条连接。
