@@ -14,6 +14,8 @@ from pathlib import Path
 
 import asyncssh
 
+from ssh_mcp.fsutil import replace_with_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,7 +65,7 @@ class KeyStore:
         with tmp.open("wb") as handle:
             handle.write(key.export_private_key("openssh"))
         _chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
         _chmod(path, 0o600)
         logger.info("generated Ed25519 key for %s@%s:%s", username, host, port)
         return key
