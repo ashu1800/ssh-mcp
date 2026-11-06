@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from ssh_mcp.fsutil import replace_with_retry
 from ssh_mcp.ssh.keys import key_id_for
 
 logger = logging.getLogger(__name__)
@@ -142,4 +143,4 @@ class AuthStateStore:
             os.chmod(tmp, 0o600)
         except OSError:  # pragma: no cover
             pass
-        os.replace(tmp, self._path)
+        replace_with_retry(tmp, self._path)

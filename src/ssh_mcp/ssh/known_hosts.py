@@ -19,6 +19,7 @@ from pathlib import Path
 
 import asyncssh
 
+from ssh_mcp.fsutil import replace_with_retry
 from ssh_mcp.ssh.keys import public_key_line
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,7 @@ class KnownHostsStore:
             os.chmod(tmp, 0o600)
         except OSError:  # pragma: no cover
             pass
-        os.replace(tmp, self._path)
+        replace_with_retry(tmp, self._path)
 
 
 class HostKeyStoreError(RuntimeError):

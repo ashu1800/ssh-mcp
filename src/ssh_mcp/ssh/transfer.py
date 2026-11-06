@@ -34,6 +34,7 @@ import asyncssh
 
 from ssh_mcp.config import PathNotAllowed, Settings
 from ssh_mcp.errors import ToolFailure, validate_remote_path
+from ssh_mcp.fsutil import replace_with_retry
 from ssh_mcp.ssh.sftp_ops import replace_file
 
 logger = logging.getLogger(__name__)
@@ -871,7 +872,7 @@ class SftpTransferEngine:
             ) from None
 
     async def _commit_local(self, part_path: Path, target: Path) -> None:
-        await asyncio.to_thread(os.replace, part_path, target)
+        await asyncio.to_thread(replace_with_retry, part_path, target)
 
     async def _delete_quietly(self, sftp: asyncssh.SFTPClient, path: str) -> None:
         with contextlib.suppress(Exception):

@@ -53,6 +53,7 @@ async def test_all_expected_tools_are_registered(tools):
         "get_system_overview",
         "list_processes",
         "list_listening_ports",
+        "get_health_summary",
     }
 
 

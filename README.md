@@ -371,9 +371,10 @@ SSH_MCP_HTTP_TOKEN=change-me python -m ssh_mcp --transport http
 | `list_services` | 按 running / failed 列出服务 |
 | `tail_log` | 日志尾部，支持 `journalctl -u` 或文件 `tail -n`，**永不跟随** |
 | `get_disk_usage` | 各挂载点使用率，≥85% 时给出 warning |
-| `get_system_overview` | 主机名、内核、发行版、uptime、负载、内存、CPU 数 |
-| `list_processes` | 按 CPU/内存排序的进程列表（批处理版 top） |
-| `list_listening_ports` | 监听端口及占用进程 |
+| `get_system_overview` | 主机名、内核、发行版、uptime、负载、内存、交换、CPU 数 |
+| `list_processes` | 进程列表：CPU 用 top 两次采样算瞬时值，默认过滤掉本服务器自己的 ps/ss/top 辅助进程 |
+| `list_listening_ports` | 监听端口及占用进程；同一端口的 IPv4/IPv6 合并，`public` 标记是否绑定到 0.0.0.0/* |
+| `get_health_summary` | 一次拿齐：概览 + 内存/交换 + 磁盘 + failed 服务 + Docker 容器 + 证书剩余天数 + 告警 |
 
 ### 一步连上任意服务器
 
