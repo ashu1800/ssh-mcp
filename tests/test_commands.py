@@ -183,3 +183,34 @@ async def test_timeout_returns_promptly_without_waiting_for_the_command(runner, 
 
     assert result.timed_out is True
     assert elapsed < 8, f"timeout took {elapsed:.1f}s; it must not wait for the command"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Combined short options are the form people actually type; ``-bn1``
+        # was rejected while the hint itself recommended it.
+        "top -bn1",
+        "top -bH -n1",
+        "top -b -n1 -d 1",
+        "top --batch -n1",
+    ],
+)
+async def test_batch_top_forms_are_allowed(command):
+    assert _interactive_reason(command) is None
+
+
+@pytest.mark.parametrize("command", ["top -H", "top -n1", "top -d 1", "top -w 200"])
+async def test_top_without_the_batch_flag_is_still_refused(command):
+    # ``-H`` and ``-n`` do not imply batch mode; those forms hang on exec.
+    assert _interactive_reason(command) == "top"
+
+
+@pytest.mark.asyncio
+async def test_rejection_names_the_segment_not_the_whole_line(runner, handle):
+    with pytest.raises(ToolFailure) as excinfo:
+        await runner.run(handle, "echo one; top -H; echo two")
+    details = excinfo.value.details
+    assert details["command"] == "top"
+    assert details["segment"] == "top -H"
+    assert "top -b -n1" in excinfo.value.hint

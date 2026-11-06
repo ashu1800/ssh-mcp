@@ -39,6 +39,31 @@ _REPL_WITHOUT_ARGS = frozenset(
 _FOLLOW_FLAGS = frozenset({"-f", "-F", "--follow", "--follow=yes"})
 
 
+def _short_flags(args: list[str]) -> set[str]:
+    """Letters in clustered short options, so ``-bn1`` reads as ``{b, n}``.
+
+    ``top -bn1`` is the batch form people actually type; matching only the
+    literal ``-b`` rejected it while accepting ``top -H`` (which is interactive
+    and would hang). Both directions were wrong.
+    """
+    letters: set[str] = set()
+    for token in args:
+        if not token.startswith("-") or token.startswith("--") or token == "-":
+            continue
+        for char in token[1:]:
+            if not char.isalpha():
+                break
+            letters.add(char)
+    return letters
+
+
+def _is_batch_top(args: list[str]) -> bool:
+    """Whether ``top`` is asked for a single batch snapshot."""
+    if "--batch" in args or "b" in _short_flags(args):
+        return True
+    return False
+
+
 @dataclass
 class CommandResult:
     stdout: str
@@ -120,27 +145,41 @@ def _split_shell(command: str) -> list[tuple[list[str], bool, str]]:
     return commands
 
 
-def _interactive_reason(command: str) -> str | None:
-    """Return the offending program when ``command`` obviously needs a TTY."""
+def _interactive_offense(command: str) -> tuple[str, str] | None:
+    """Return ``(program, segment)`` for the first part that needs a TTY.
+
+    ``segment`` is the offending command as it appeared, which matters for a
+    compound line: reporting the whole line left the caller guessing which
+    half to rewrite.
+    """
     stripped = command.strip()
     if not stripped:
         return None
     for tokens, fed_by_pipe in _split_shell(stripped):
+        original = list(tokens)
         tokens = _strip_wrappers(tokens)
         if not tokens:
             continue
         program = tokens[0].rsplit("/", 1)[-1]
         rest = tokens[1:]
         if program in _ALWAYS_INTERACTIVE:
-            return program
-        if program == "top" and not any(token in {"-b", "-H", "-n"} for token in rest):
-            # ``top -b -n1`` is the documented batch alternative.
-            return program
+            return program, " ".join(original)
+        if program == "top" and not _is_batch_top(rest):
+            # ``top -b -n1`` / ``top -bn1`` are the documented batch forms;
+            # ``-H`` or ``-n`` alone still open an interactive display.
+            return program, " ".join(original)
         if program in {"tail", "journalctl"} and _FOLLOW_FLAGS.intersection(rest):
-            return f"{program} {' '.join(sorted(_FOLLOW_FLAGS.intersection(rest)))}"
+            flag = sorted(_FOLLOW_FLAGS.intersection(rest))[0]
+            return f"{program} {flag}", " ".join(original)
         if program in _REPL_WITHOUT_ARGS and not _reads_stdin(program, rest, fed_by_pipe):
-            return program
+            return program, " ".join(original)
     return None
+
+
+def _interactive_reason(command: str) -> str | None:
+    """Return the offending program when ``command`` obviously needs a TTY."""
+    offense = _interactive_offense(command)
+    return offense[0] if offense else None
 
 
 def _reads_stdin(program: str, rest: list[str], fed_by_pipe: bool) -> bool:
@@ -210,6 +249,34 @@ def _strip_wrappers(tokens: list[str]) -> list[str]:
     return tokens[index:]
 
 
+def _interactive_hint(offender: str, segment: str) -> str:
+    """Explain the refusal with the fix for this specific program."""
+    tail = (
+        "改法：把查询交给参数（`mysql -e 'select 1'`、`psql -c 'select 1'`），"
+        "或从 stdin 喂输入（`echo 'select 1' | redis-cli`）；"
+        "只有在确实需要 TTY 时才传 allow_interactive=true。"
+    )
+    if offender.startswith("top"):
+        return (
+            f"命令里的 `{offender}` 会打开交互式界面，在非交互通道上会一直挂起到超时。"
+            f"改法：加批处理参数 `top -b -n1`（连写 `top -bn1` 也可以），或用 list_processes。{tail}"
+        )
+    if offender.startswith("tail"):
+        return (
+            f"命令里的 `{offender}` 会持续跟随文件，永不结束。"
+            f"改法：用 `tail -n 100`（不要 -f），或用 tail_log。{tail}"
+        )
+    if offender.startswith("journalctl"):
+        return (
+            f"命令里的 `{offender}` 会持续跟随日志。"
+            f"改法：用 `journalctl --no-pager -n 100`（不要 -f），或用 tail_log。{tail}"
+        )
+    return (
+        f"命令里的 `{offender}` 会等待终端输入（片段：`{segment}`），"
+        f"在非交互通道上会一直挂起到超时。{tail}"
+    )
+
+
 class CommandRunner:
     """Runs commands on a pooled connection with bounded output and hard timeouts."""
 
@@ -228,20 +295,16 @@ class CommandRunner:
     ) -> CommandResult:
         validate_remote_path(command, "command")
         if not allow_interactive:
-            offender = _interactive_reason(command)
-            if offender is not None:
+            offense = _interactive_offense(command)
+            if offense is not None:
+                offender, segment = offense
                 raise ToolFailure(
                     "interactive_command_rejected",
                     stage="validate",
-                    hint=(
-                        f"命令里的 `{offender}` 会等待终端输入，在非交互通道上会一直挂起到超时。"
-                        "改法：加批处理参数（`top -b -n1`、`tail -n 100`、`journalctl --no-pager -n 100`），"
-                        "把查询交给参数（`mysql -e 'select 1'`、`psql -c 'select 1'`），"
-                        "或从 stdin 喂输入（`echo 'select 1' | redis-cli`）。"
-                        "只有在确实需要 TTY 时才传 allow_interactive=true。"
-                    ),
+                    hint=_interactive_hint(offender, segment),
                     retryable=False,
                     command=offender,
+                    segment=segment,
                 )
 
         timeout = timeout_seconds if timeout_seconds is not None else self._settings.command_timeout_default
@@ -475,14 +538,19 @@ class CommandRunner:
         and needs no reaper of its own.
         """
         validate_remote_path(command, "command")
-        offender = _interactive_reason(command)
-        if offender is not None:
+        offense = _interactive_offense(command)
+        if offense is not None:
+            offender, segment = offense
             raise ToolFailure(
                 "interactive_command_rejected",
                 stage="validate",
-                hint=f"命令里的 `{offender}` 会等待终端输入；后台运行同样需要批处理写法。",
+                hint=(
+                    f"命令里的 `{offender}` 会等待终端输入；后台运行同样需要批处理写法。"
+                    f"片段：`{segment}`。"
+                ),
                 retryable=False,
                 command=offender,
+                segment=segment,
             )
         try:
             async with borrow(self._pool, handle) as acquired:
